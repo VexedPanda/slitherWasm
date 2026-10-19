@@ -3,6 +3,7 @@
 
 pub mod cansolve;
 pub mod engine;
+pub mod generator;
 pub mod sat;
 pub mod solver;
 pub mod topology;
@@ -11,6 +12,7 @@ use solver::{Board, SolveResult};
 use std::cell::RefCell;
 
 thread_local! {
+    static GENERATORS: RefCell<Vec<Option<generator::Generator>>> = const { RefCell::new(Vec::new()) };
     static TOPOLOGIES: RefCell<Vec<Option<topology::Topology>>> = const { RefCell::new(Vec::new()) };
     static RULE_SETS: RefCell<Vec<Option<cansolve::RuleSet>>> = const { RefCell::new(Vec::new()) };
     static BOARDS: RefCell<Vec<Option<Board>>> = const { RefCell::new(Vec::new()) };
@@ -263,4 +265,123 @@ pub unsafe extern "C" fn can_solve_hard(topology_handle: u32, rules_handle: u32,
             }
         })
     })
+}
+
+fn with_generator_context<T>(
+    board_handle: u32,
+    topology_handle: u32,
+    rules_handle: u32,
+    callback: impl FnOnce(&solver::Board, Option<&topology::Topology>, Option<&cansolve::RuleSet>) -> T,
+) -> T {
+    BOARDS.with(|boards| {
+        let boards = boards.borrow();
+        let board = boards[board_handle as usize].as_ref().expect("disposed board");
+        TOPOLOGIES.with(|topologies| {
+            let topologies = topologies.borrow();
+            let topology = topologies.get(topology_handle as usize).and_then(|t| t.as_ref());
+            RULE_SETS.with(|sets| {
+                let sets = sets.borrow();
+                let rules = sets.get(rules_handle as usize).and_then(|r| r.as_ref());
+                callback(board, topology, rules)
+            })
+        })
+    })
+}
+
+/// Starts generating a puzzle (see generator.rs), returning its handle. `check` is 0 for no difficulty check, 1 for the
+/// EASY/MEDIUM rules and 2 for HARD's (with the rules handle, and for HARD the topology handle; 0xffffffff for none).
+/// `resume` holds earlier progress events (type, face, value) to continue from.
+///
+/// # Safety
+/// `resume` must reference `resume_length` u32s.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn gen_create(
+    board_handle: u32,
+    topology_handle: u32,
+    rules_handle: u32,
+    check: u32,
+    seed_low: u32,
+    seed_high: u32,
+    resume: *const u32,
+    resume_length: u32,
+) -> u32 {
+    let resume = if resume_length == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(resume, resume_length as usize) }
+    };
+    let check = match check {
+        1 => generator::Check::Simple,
+        2 => generator::Check::Hard,
+        _ => generator::Check::None,
+    };
+    let seed = ((seed_high as u64) << 32) | seed_low as u64;
+    let generator = with_generator_context(board_handle, topology_handle, rules_handle, |board, topology, rules| {
+        generator::Generator::new(board, topology, rules, check, seed, resume)
+    });
+    GENERATORS.with(|generators| {
+        let mut generators = generators.borrow_mut();
+        if let Some(index) = generators.iter().position(|g| g.is_none()) {
+            generators[index] = Some(generator);
+            index as u32
+        } else {
+            generators.push(Some(generator));
+            (generators.len() - 1) as u32
+        }
+    })
+}
+
+/// Runs up to `steps` steps (about a face each). Returns 0 while running, 1 when done, 2 if generation failed. The
+/// progress events so far are then in the output buffer (type, face, value triples).
+#[unsafe(no_mangle)]
+pub extern "C" fn gen_step(handle: u32, board_handle: u32, topology_handle: u32, rules_handle: u32, steps: u32) -> u32 {
+    GENERATORS.with(|generators| {
+        let mut generators = generators.borrow_mut();
+        let generator = generators[handle as usize].as_mut().expect("disposed generator");
+        let mut status = generator::Status::Running;
+        with_generator_context(board_handle, topology_handle, rules_handle, |board, topology, rules| {
+            for _ in 0..steps.max(1) {
+                status = generator.step(board, topology, rules);
+                if !matches!(status, generator::Status::Running) {
+                    break;
+                }
+            }
+        });
+        OUTPUT.with(|output| {
+            let mut output = output.borrow_mut();
+            output.clear();
+            output.append(&mut generator.events);
+        });
+        match status {
+            generator::Status::Running => 0,
+            generator::Status::Done => 1,
+            generator::Status::Failed => 2,
+        }
+    })
+}
+
+/// Puts the generated puzzle in the output buffer: its face values (0xff for none), then its solution's edges
+#[unsafe(no_mangle)]
+pub extern "C" fn gen_result(handle: u32) {
+    GENERATORS.with(|generators| {
+        let generators = generators.borrow();
+        let generator = generators[handle as usize].as_ref().expect("disposed generator");
+        let (values, solution) = generator.result();
+        OUTPUT.with(|output| {
+            let mut output = output.borrow_mut();
+            output.clear();
+            output.extend(values.iter().map(|&v| v as u32));
+            output.extend_from_slice(solution);
+        });
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gen_dispose(handle: u32) {
+    GENERATORS.with(|generators| {
+        if let Some(slot) = generators.borrow_mut().get_mut(handle as usize) {
+            *slot = None;
+        }
+    });
 }

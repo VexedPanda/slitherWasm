@@ -1,3 +1,4 @@
+import { wasmGenerate } from '../../wasm/slitherCore.ts';
 import { TBoard } from '../board/core/TBoard.ts';
 import { TFace } from '../board/core/TFace.ts';
 import { TStructure } from '../board/core/TStructure.ts';
@@ -15,10 +16,78 @@ import { greedyFaceMinimize } from './greedyFaceMinimize.ts';
 import { withAllFacesFilled } from './withAllFacesFilled.ts';
 
 import { TEmitter, TReadOnlyProperty } from 'scenerystack/axon';
+import { dotRandom } from 'scenerystack/dot';
 
 import { interruptableSleep } from '../../util/interruptableSleep.ts';
 
+/**
+ * Generates a puzzle: values are added until it has a unique solution, then filled in (unless there's no difficulty
+ * limit), then removed while it stays unique and solvable at the difficulty. Runs in the WebAssembly core
+ * (wasm/src/generator.rs) when the difficulty check is there, otherwise in TS (generateAdditiveConstrainedTS).
+ */
 export const generateAdditiveConstrained = async (
+  board: TBoard,
+  canSolveDifficulty: CanSolveDifficulty,
+  interruptedProperty: TReadOnlyProperty<boolean>,
+  faceDefineEmitter: TEmitter<[index: number, state: FaceValue]>,
+  faceMinimizeEmitter: TEmitter<[index: number, state: FaceValue]>,
+  faceResetEmitter: TEmitter,
+  // Progress (since the last reset) of an earlier, interrupted generation to continue from. These events are not
+  // emitted again.
+  resumeProgress: GenerationProgressEvent[] = [],
+): Promise<TSolvedPuzzle<TStructure, TCompleteData> | null> => {
+  const rules = canSolveDifficulty.getWasmRules?.(board) ?? null;
+  if (!rules && canSolveDifficulty !== CanSolveDifficulty.NO_LIMIT) {
+    return generateAdditiveConstrainedTS(
+      board,
+      canSolveDifficulty,
+      interruptedProperty,
+      faceDefineEmitter,
+      faceMinimizeEmitter,
+      faceResetEmitter,
+      resumeProgress,
+    );
+  }
+
+  try {
+    // Seeded from dotRandom, so seeding it makes generation deterministic
+    const seed: [number, number] = [
+      Math.floor(dotRandom.nextDouble() * 2 ** 32),
+      Math.floor(dotRandom.nextDouble() * 2 ** 32),
+    ];
+    const result = await wasmGenerate(
+      board,
+      rules,
+      seed,
+      resumeProgress,
+      (event) => {
+        if (event.type === 'reset') {
+          faceResetEmitter.emit();
+        } else if (event.type === 'define') {
+          faceDefineEmitter.emit(event.index, event.state);
+        } else {
+          faceMinimizeEmitter.emit(event.index, event.state);
+        }
+      },
+      () => interruptableSleep(0, interruptedProperty),
+    );
+    if (!result) {
+      return null;
+    }
+    const cleanState = CompleteData.empty(board);
+    board.faces.forEach((face, index) => cleanState.setFaceValue(face, result.faceValues[index]));
+    return getSolvedPuzzle(board, cleanState, result.solutionEdges);
+  } catch (e) {
+    if (e instanceof InterruptedError) {
+      return null;
+    } else {
+      throw e;
+    }
+  }
+};
+
+// The TS implementation (for difficulties without WebAssembly checks)
+export const generateAdditiveConstrainedTS = async (
   board: TBoard,
   canSolveDifficulty: CanSolveDifficulty,
   interruptedProperty: TReadOnlyProperty<boolean>,

@@ -114,6 +114,10 @@ impl Board {
         }
     }
 
+    pub fn face_edge_count(&self, f: usize) -> usize {
+        (self.face_edge_offsets[f + 1] - self.face_edge_offsets[f]) as usize
+    }
+
     pub fn vertex_degree(&self, v: usize) -> usize {
         (self.vertex_edge_offsets[v + 1] - self.vertex_edge_offsets[v]) as usize
     }
@@ -279,6 +283,8 @@ pub fn solve(
             .any(|&f| f != u32::MAX && face_values[f as usize] != NO_VALUE)
     };
 
+    crate::generator::profile::count(3, 0);
+    let _solve_timer = crate::generator::profile::Timer::new(4);
     let mut in_model = vec![false; board.num_edges];
     let mut visited = vec![false; board.num_edges];
     let mut iterations = 0u64;
@@ -367,6 +373,7 @@ pub fn solve(
         }
 
         iterations += 1;
+        crate::generator::profile::count(5, 0);
         if iterations > max_iterations {
             return (SolveResult::BudgetExceeded, sat.conflicts);
         }
