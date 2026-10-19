@@ -19,6 +19,7 @@ import { TinyEmitter, TinyProperty } from 'scenerystack/axon';
 import { dotRandom } from 'scenerystack/dot';
 
 const count = Number(process.argv[2] ?? 3);
+const MIN_TOUCHED_FRACTION = 0.5;
 let failures = 0;
 
 const check = (
@@ -39,11 +40,14 @@ const check = (
     solutions[0].every((edge) => puzzle.blackEdges.has(edge));
   const solvable = difficulty.tsCanSolve(board, puzzle.cleanState.clone());
   const clues = board.faces.filter((face) => puzzle.cleanState.getFaceValue(face) !== null).length;
-  if (!unique || !solvable) {
+  // The loop should wind across the board (not, say, a small loop in a corner): most faces touch it
+  const touched = board.faces.filter((face) => face.edges.some((edge) => puzzle.blackEdges.has(edge))).length;
+  const spread = touched >= MIN_TOUCHED_FRACTION * board.faces.length;
+  if (!unique || !solvable || !spread) {
     failures++;
   }
   console.log(
-    `${unique && solvable ? 'ok  ' : 'FAIL'} ${label}: unique ${unique}, solvable ${solvable}, ${clues} clues`,
+    `${unique && solvable && spread ? 'ok  ' : 'FAIL'} ${label}: unique ${unique}, solvable ${solvable}, ${clues} clues, loop touches ${touched}/${board.faces.length} faces`,
   );
 };
 
@@ -94,6 +98,23 @@ for (const [generatorName, parameters] of [
     const partial = await run(board, difficulty, board.faces.length + 20);
     const resumed = await run(board, difficulty, undefined, partial.events);
     check(`${generatorName} ${name} resumed after ${partial.events.length} events`, board, difficulty, resumed.puzzle);
+  }
+}
+
+// A larger board (MEDIUM, the generation the large-board work targets)
+{
+  const generator = polygonGenerators.find((g) => g.name === 'Square')!;
+  const board = PolygonGeneratorBoard.get(generator, { ...generator.defaultParameterValues, width: 30, height: 30 });
+  for (let i = 0; i < count; i++) {
+    dotRandom.setSeed(1000 * i);
+    const start = performance.now();
+    const { puzzle } = await run(board, CanSolveDifficulty.MEDIUM);
+    check(
+      `Square 30x30 MEDIUM #${i} (${((performance.now() - start) / 1000).toFixed(1)} s)`,
+      board,
+      CanSolveDifficulty.MEDIUM,
+      puzzle,
+    );
   }
 }
 

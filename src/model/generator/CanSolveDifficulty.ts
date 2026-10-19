@@ -336,7 +336,25 @@ export default class CanSolveDifficulty extends EnumerationValue {
     return simpleRegionIsSolved(state);
   });
 
-  public static readonly NO_LIMIT = new CanSolveDifficulty(() => true);
+  // (Any unique puzzle. Its generation still uses the sound MEDIUM rules to build puzzles from a random loop, see
+  // WasmDifficultyRules.)
+  public static readonly NO_LIMIT = new CanSolveDifficulty(() => true, {
+    canSolve: () => true,
+    getRules: (board) => ({
+      key: 'NO_LIMIT',
+      getRules: () => {
+        throw new Error('NO_LIMIT has no rules');
+      },
+      hard: false,
+      noCheck: true,
+      sound: {
+        key: 'MEDIUM-sound',
+        getRules: () => compilePatternRules(board, withoutHighlander(MEDIUM_GROUPS)),
+        impliesDifficulty: true,
+        only: false,
+      },
+    }),
+  });
 
   public static readonly enumeration = new Enumeration(CanSolveDifficulty);
 }

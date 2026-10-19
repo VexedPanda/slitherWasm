@@ -386,6 +386,8 @@ export type WasmDifficultyRules = {
   // `impliesDifficulty`: they're a subset of the difficulty's rules. `only`: minimization only removes values while they
   // still solve the puzzle (otherwise it falls back to the difficulty check and SAT).
   sound?: { key: string; getRules: () => CompiledRules; impliesDifficulty: boolean; only: boolean };
+  // No difficulty check (only the sound rules, for building the puzzle)
+  noCheck?: boolean;
 };
 
 export type WasmGenerationEvent =
@@ -410,7 +412,7 @@ export const wasmGenerate = async (
   const boardHandle = getCoreBoard(board).handle;
   // With sound-only rules that imply the difficulty, they're the whole check (see generator.rs), so the (large) main and
   // easier rules aren't compiled
-  const soundOnly = !!rules?.sound && rules.sound.only && rules.sound.impliesDifficulty;
+  const soundOnly = (!!rules?.sound && rules.sound.only && rules.sound.impliesDifficulty) || !!rules?.noCheck;
   const rulesHandle = rules && !soundOnly ? getRulesHandle(board, rules.key, rules.getRules) : NONE;
   const easierRulesHandle =
     rules?.easier && !soundOnly ? getRulesHandle(board, rules.easier.key, rules.easier.getRules) : NONE;
@@ -422,7 +424,7 @@ export const wasmGenerate = async (
     : NONE;
   const topologyHandle = rules?.hard ? getTopologyHandle(board) : NONE;
   const check =
-    !rules ? 0
+    !rules || rules.noCheck ? 0
     : rules.hard ? 2
     : 1;
 
