@@ -36,9 +36,6 @@ pub struct RuleSet {
     pub(crate) color_conditions: Vec<(u32, u32, bool)>,
     pub(crate) color_output_offsets: Vec<u32>,
     pub(crate) color_outputs: Vec<(u32, u32, bool)>,
-    // Node (face, or the outside) => clauses with a color condition on it (CSR)
-    color_watch_offsets: Vec<u32>,
-    color_watches: Vec<u32>,
     // Clauses by one of their face conditions, as face * 256 + value (CSR over sorted keys), and those without any
     first_condition_keys: Vec<u32>,
     first_condition_offsets: Vec<u32>,
@@ -66,8 +63,6 @@ impl RuleSet {
             color_conditions: Vec::new(),
             color_output_offsets: Vec::with_capacity(clause_count + 1),
             color_outputs: Vec::new(),
-            color_watch_offsets: Vec::new(),
-            color_watches: Vec::new(),
             first_condition_keys: Vec::new(),
             first_condition_offsets: Vec::new(),
             first_condition_clauses: Vec::new(),
@@ -145,42 +140,6 @@ impl RuleSet {
         }
         rules.watch_offsets = counts;
 
-        // Color watch lists
-        let num_nodes = rules
-            .color_conditions
-            .iter()
-            .map(|&(a, b, _)| a.max(b) as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut counts = vec![0u32; num_nodes + 1];
-        for c in 0..clause_count {
-            for &(a, b, _) in rules.color_conditions_of(c) {
-                counts[a as usize + 1] += 1;
-                if b != a {
-                    counts[b as usize + 1] += 1;
-                }
-            }
-        }
-        for x in 0..num_nodes {
-            counts[x + 1] += counts[x];
-        }
-        let mut fill = counts.clone();
-        let mut color_watches = vec![0; counts[num_nodes] as usize];
-        for c in 0..clause_count {
-            for k in rules.color_condition_offsets[c]..rules.color_condition_offsets[c + 1] {
-                let (a, b, _) = rules.color_conditions[k as usize];
-                for x in [a, b] {
-                    if x == b && a == b {
-                        continue;
-                    }
-                    color_watches[fill[x as usize] as usize] = c as u32;
-                    fill[x as usize] += 1;
-                }
-            }
-        }
-        rules.color_watch_offsets = counts;
-        rules.color_watches = color_watches;
-
         // Index by first face condition
         let mut keyed: Vec<(u32, u32)> = Vec::new();
         for c in 0..clause_count {
@@ -227,15 +186,6 @@ impl RuleSet {
             }
         });
         self.unconditioned_clauses.iter().chain(keyed).copied()
-    }
-
-    #[inline]
-    pub(crate) fn color_watches_of(&self, x: u32) -> &[u32] {
-        let x = x as usize;
-        if x + 1 >= self.color_watch_offsets.len() {
-            return &[];
-        }
-        &self.color_watches[self.color_watch_offsets[x] as usize..self.color_watch_offsets[x + 1] as usize]
     }
 
     #[inline]

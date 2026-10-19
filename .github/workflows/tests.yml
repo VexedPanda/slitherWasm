@@ -52,6 +52,9 @@ jobs:
       - name: Solver equivalence
         run: npm run test:solver
 
+      - name: Generated puzzles are valid
+        run: npm run test:generator
+
   typecheck:
     runs-on: ubuntu-latest
     timeout-minutes: 10

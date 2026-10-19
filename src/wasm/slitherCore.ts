@@ -59,6 +59,27 @@ type CoreExports = {
     faceHalfEdges: number,
   ) => number;
   can_solve_hard: (topologyHandle: number, rulesHandle: number, faceValues: number) => number;
+  gen_create: (
+    boardHandle: number,
+    topologyHandle: number,
+    rulesHandle: number,
+    easierRulesHandle: number,
+    check: number,
+    seedLow: number,
+    seedHigh: number,
+    resume: number,
+    resumeLength: number,
+  ) => number;
+  gen_step: (
+    handle: number,
+    boardHandle: number,
+    topologyHandle: number,
+    rulesHandle: number,
+    easierRulesHandle: number,
+    steps: number,
+  ) => number;
+  gen_result: (handle: number) => void;
+  gen_dispose: (handle: number) => void;
 };
 
 let core: CoreExports | null = null;
@@ -237,6 +258,25 @@ export const wasmSolve = (
 };
 
 const rulesHandles = new WeakMap<TBoard, Map<string, number>>();
+
+// Compiled rules registered with the core, once per board and key
+const getRulesHandle = (board: TBoard, rulesKey: string, getRules: () => CompiledRules): number => {
+  const core = getCore();
+  let boardRules = rulesHandles.get(board);
+  if (!boardRules) {
+    boardRules = new Map();
+    rulesHandles.set(board, boardRules);
+  }
+  let rulesHandle = boardRules.get(rulesKey);
+  if (rulesHandle === undefined) {
+    const rules = getRules();
+    rulesHandle = withU32Array(rules.clauses, (pointer) =>
+      core.rules_create(getCoreBoard(board).handle, rules.numSectors, pointer, rules.clauses.length, rules.clauseCount),
+    );
+    boardRules.set(rulesKey, rulesHandle);
+  }
+  return rulesHandle;
+};
 const topologyHandles = new WeakMap<TBoard, number>();
 
 // The board's half-edge topology, in the TS board's orders (see wasm/src/topology.rs)
@@ -318,19 +358,7 @@ export const wasmCanSolve = (
   const core = getCore();
   const coreBoard = getCoreBoard(board);
 
-  let boardRules = rulesHandles.get(board);
-  if (!boardRules) {
-    boardRules = new Map();
-    rulesHandles.set(board, boardRules);
-  }
-  let rulesHandle = boardRules.get(rulesKey);
-  if (rulesHandle === undefined) {
-    const rules = getRules();
-    rulesHandle = withU32Array(rules.clauses, (pointer) =>
-      core.rules_create(coreBoard.handle, rules.numSectors, pointer, rules.clauses.length, rules.clauseCount),
-    );
-    boardRules.set(rulesKey, rulesHandle);
-  }
+  const rulesHandle = getRulesHandle(board, rulesKey, getRules);
 
   const faceValues = new Uint8Array(core.memory.buffer, coreBoard.faceValuesPointer, board.faces.length);
   board.faces.forEach((face, index) => {
@@ -343,4 +371,103 @@ export const wasmCanSolve = (
       core.can_solve_hard(getTopologyHandle(board), rulesHandle, coreBoard.faceValuesPointer)
     : core.can_solve(coreBoard.handle, rulesHandle, coreBoard.faceValuesPointer);
   return result < 0 ? null : result === 1;
+};
+
+/** The difficulty check a generation uses (see CanSolveDifficulty) */
+export type WasmDifficultyRules = {
+  key: string;
+  getRules: () => CompiledRules;
+  hard: boolean;
+  // An easier difficulty's EASY/MEDIUM-style rules (a subset of these), tried first since they're cheaper
+  easier?: { key: string; getRules: () => CompiledRules };
+};
+
+export type WasmGenerationEvent =
+  { type: 'define' | 'minimize'; index: number; state: number | null } | { type: 'reset' };
+
+const NONE = 0xffffffff;
+
+/**
+ * Generates a puzzle (wasm/src/generator.rs), in steps: progress events are reported as they happen, and it yields to
+ * the event loop between steps (throwing from yieldAndCheck when interrupted). Resumes from earlier progress events if
+ * given. Returns the puzzle's face values (null for none) and its solution's edges, or null if generation failed.
+ */
+export const wasmGenerate = async (
+  board: TBoard,
+  rules: WasmDifficultyRules | null,
+  seed: [number, number],
+  resume: WasmGenerationEvent[],
+  onEvent: (event: WasmGenerationEvent) => void,
+  yieldAndCheck: () => Promise<void>,
+): Promise<{ faceValues: (number | null)[]; solutionEdges: TEdge[] } | null> => {
+  const core = getCore();
+  const boardHandle = getCoreBoard(board).handle;
+  const rulesHandle = rules ? getRulesHandle(board, rules.key, rules.getRules) : NONE;
+  const easierRulesHandle = rules?.easier ? getRulesHandle(board, rules.easier.key, rules.easier.getRules) : NONE;
+  const topologyHandle = rules?.hard ? getTopologyHandle(board) : NONE;
+  const check =
+    !rules ? 0
+    : rules.hard ? 2
+    : 1;
+
+  const resumeData: number[] = [];
+  for (const event of resume) {
+    if (event.type === 'reset') {
+      resumeData.push(2, 0, 0);
+    } else {
+      resumeData.push(event.type === 'define' ? 0 : 1, event.index, event.state === null ? 0xff : event.state);
+    }
+  }
+  const handle = withU32Array(resumeData, (pointer) =>
+    core.gen_create(
+      boardHandle,
+      topologyHandle,
+      rulesHandle,
+      easierRulesHandle,
+      check,
+      seed[0],
+      seed[1],
+      pointer,
+      resumeData.length,
+    ),
+  );
+
+  try {
+    let lastYield = performance.now();
+    while (true) {
+      const status = core.gen_step(handle, boardHandle, topologyHandle, rulesHandle, easierRulesHandle, 1);
+      const output = new Uint32Array(core.memory.buffer, core.output_pointer(), core.output_length()).slice();
+      for (let i = 0; i < output.length; i += 3) {
+        const type = output[i];
+        onEvent(
+          type === 2 ?
+            { type: 'reset' }
+          : {
+              type: type === 0 ? 'define' : 'minimize',
+              index: output[i + 1],
+              state: output[i + 2] === 0xff ? null : output[i + 2],
+            },
+        );
+      }
+      if (status === 2) {
+        return null;
+      }
+      if (status === 1) {
+        core.gen_result(handle);
+        const result = new Uint32Array(core.memory.buffer, core.output_pointer(), core.output_length());
+        const faceValues = Array.from(result.subarray(0, board.faces.length), (value) =>
+          value === 0xff ? null : value,
+        );
+        const solutionEdges = Array.from(result.subarray(board.faces.length), (index) => board.edges[index]);
+        return { faceValues, solutionEdges };
+      }
+      // Yield regularly (steps take up to tens of milliseconds)
+      if (performance.now() - lastYield > 8) {
+        await yieldAndCheck();
+        lastYield = performance.now();
+      }
+    }
+  } finally {
+    core.gen_dispose(handle);
+  }
 };

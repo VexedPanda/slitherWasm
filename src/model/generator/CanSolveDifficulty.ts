@@ -1,5 +1,5 @@
 import { RuleGroupLimit, compilePatternRules } from '../../wasm/compilePatternRules.ts';
-import { wasmCanSolve as coreCanSolve } from '../../wasm/slitherCore.ts';
+import { WasmDifficultyRules, wasmCanSolve as coreCanSolve } from '../../wasm/slitherCore.ts';
 import { TBoard } from '../board/core/TBoard.ts';
 import { TCompleteData } from '../data/combined/TCompleteData.ts';
 import { TAnnotatedAction } from '../data/core/TAnnotatedAction.ts';
@@ -29,26 +29,54 @@ type CanSolve = (board: TBoard, state: TState<TCompleteData>) => boolean;
 
 // EASY, MEDIUM and HARD are checked by the WebAssembly core (wasm/src/cansolve.rs, and wasm/src/engine.rs for HARD's
 // larger rule set), with the same rules as their TS solvers
-const wasmCanSolve = (difficulty: string, groups: RuleGroupLimit[], hard = false): CanSolve => {
-  return (board, state) => {
-    const result = coreCanSolve(board, state, difficulty, () => compilePatternRules(board, groups), hard);
-    if (result === null) {
-      throw new InvalidStateError('Contradiction while checking difficulty');
-    }
-    return result;
+type WasmCheck = { canSolve: CanSolve; getRules: (board: TBoard) => WasmDifficultyRules };
+
+// The rule groups of EASY and MEDIUM (each difficulty's rules include the easier ones', see generator.rs)
+const EASY_GROUPS: RuleGroupLimit[] = [{ group: generalEdgeMixedGroup, size: 120 }];
+const MEDIUM_GROUPS: RuleGroupLimit[] = [
+  { group: generalEdgeSectorMixedGroup, size: 50 },
+  { group: generalEdgeMixedGroup, size: 360 },
+];
+
+const wasmCheck = (
+  difficulty: string,
+  groups: RuleGroupLimit[],
+  hard = false,
+  easier?: { key: string; groups: RuleGroupLimit[] },
+): WasmCheck => {
+  const getRules = (board: TBoard): WasmDifficultyRules => ({
+    key: difficulty,
+    getRules: () => compilePatternRules(board, groups),
+    hard: hard,
+    easier: easier && { key: easier.key, getRules: () => compilePatternRules(board, easier.groups) },
+  });
+  return {
+    canSolve: (board, state) => {
+      const rules = getRules(board);
+      const result = coreCanSolve(board, state, rules.key, rules.getRules, hard);
+      if (result === null) {
+        throw new InvalidStateError('Contradiction while checking difficulty');
+      }
+      return result;
+    },
+    getRules: getRules,
   };
 };
 
 export default class CanSolveDifficulty extends EnumerationValue {
   public readonly canSolve: CanSolve;
 
+  // The WebAssembly core's rules for this difficulty (used by puzzle generation), if it has them
+  public readonly getWasmRules: ((board: TBoard) => WasmDifficultyRules) | null;
+
   public constructor(
     // The TS solver implementation (the reference the WebAssembly checks are tested against)
     public readonly tsCanSolve: CanSolve,
-    wasm?: CanSolve,
+    wasm?: WasmCheck,
   ) {
     super();
-    this.canSolve = wasm ?? tsCanSolve;
+    this.canSolve = wasm?.canSolve ?? tsCanSolve;
+    this.getWasmRules = wasm?.getRules ?? null;
   }
 
   public static readonly EASY = new CanSolveDifficulty(
@@ -90,7 +118,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCanSolve('EASY', [{ group: generalEdgeMixedGroup, size: 120 }]),
+    wasmCheck('EASY', EASY_GROUPS),
   );
 
   public static readonly MEDIUM = new CanSolveDifficulty(
@@ -133,10 +161,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCanSolve('MEDIUM', [
-      { group: generalEdgeSectorMixedGroup, size: 50 },
-      { group: generalEdgeMixedGroup, size: 360 },
-    ]),
+    wasmCheck('MEDIUM', MEDIUM_GROUPS, false, { key: 'EASY', groups: EASY_GROUPS }),
   );
 
   public static readonly HARD = new CanSolveDifficulty(
@@ -184,7 +209,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCanSolve(
+    wasmCheck(
       'HARD',
       [
         { group: generalEdgeColorMixedGroup, size: 600 },
@@ -192,6 +217,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
         { group: generalEdgeMixedGroup, size: 1000 },
       ],
       true,
+      { key: 'MEDIUM', groups: MEDIUM_GROUPS },
     ),
   );
 
