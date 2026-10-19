@@ -144,6 +144,13 @@ pub struct Engine<'a> {
     alive: Vec<bool>,
     fired: Vec<bool>,
     color_recheck: Vec<u32>,
+    recheck_queued: Vec<bool>,
+    // Node (face, or the outside) => clauses waiting on a color condition involving it (like watched literals: each
+    // waiting clause is listed under both nodes of its first unmet condition, which can only become met when one of
+    // their classes changes). Entries may be stale.
+    waiting: Vec<Vec<u32>>,
+    // Reused buffers for FaceColorDisconnectionSolver
+    scratch: Option<Scratch>,
 
     // Dirty queues, one per kind of rule
     simple_vertex: Queue,
@@ -224,6 +231,17 @@ impl<'a> Engine<'a> {
             alive: vec![false; rules.clause_count()],
             fired: vec![false; rules.clause_count()],
             color_recheck: Vec::new(),
+            recheck_queued: vec![false; rules.clause_count()],
+            waiting: vec![Vec::new(); nf + 1],
+            scratch: Some(Scratch {
+                seen_half_edges: Marks::new(t.num_half_edges),
+                removed: Marks::new(t.num_half_edges),
+                visited: Marks::new(nf + 1),
+                cut: Marks::new(t.num_edges),
+                to_check: Vec::new(),
+                boundary: Vec::new(),
+                stack: Vec::new(),
+            }),
             simple_vertex: Queue::new(t.num_vertices, true),
             simple_face: Queue::new(nf, false),
             sector: Queue::new(t.num_half_edges, true),
@@ -489,7 +507,9 @@ impl<'a> Engine<'a> {
         } else {
             (rb, ra, pa ^ pb ^ difference)
         };
+        profile::count(4);
         for &m in &self.color_members[child as usize] {
+            profile::count(5);
             self.color_parent[m as usize] = parent;
             self.color_parity[m as usize] ^= flip;
         }
@@ -540,10 +560,10 @@ impl<'a> Engine<'a> {
                 self.vertex_from_edges.push(v);
             }
         }
-        for &c in self.rules.color_watches_of(x) {
-            if self.alive[c as usize] && self.remaining[c as usize] == 0 && !self.fired[c as usize] {
-                // (fired doubles as "queued for a recheck" until the recheck runs, see run)
-                self.fired[c as usize] = true;
+        for c in std::mem::take(&mut self.waiting[x as usize]) {
+            let ci = c as usize;
+            if self.alive[ci] && !self.fired[ci] && !self.recheck_queued[ci] {
+                self.recheck_queued[ci] = true;
                 self.color_recheck.push(c);
             }
         }
@@ -672,12 +692,15 @@ impl<'a> Engine<'a> {
 
     // Fires a clause whose atoms hold, if its color conditions hold too
     fn try_fire(&mut self, c: usize) -> Result<()> {
+        profile::count(2);
         let rules = self.rules;
         for &(a, b, opposite) in rules.color_conditions_of(c) {
             let (ra, pa) = self.find(a);
             let (rb, pb) = self.find(b);
             if ra != rb {
                 // Not yet (rechecked when either class changes)
+                self.waiting[a as usize].push(c as u32);
+                self.waiting[b as usize].push(c as u32);
                 return Ok(());
             }
             if (pa != pb) != opposite {
@@ -720,6 +743,7 @@ impl<'a> Engine<'a> {
                 kind = 0;
                 let rules = self.rules;
                 for k in rules.watch_offsets[atom as usize] as usize..rules.watch_offsets[atom as usize + 1] as usize {
+                    profile::count(3);
                     let c = rules.watches[k] as usize;
                     if self.alive[c] {
                         self.remaining[c] -= 1;
@@ -730,8 +754,8 @@ impl<'a> Engine<'a> {
                 }
             } else if let Some(c) = self.color_recheck.pop() {
                 kind = 1;
-                self.fired[c as usize] = false;
-                if self.alive[c as usize] {
+                self.recheck_queued[c as usize] = false;
+                if self.alive[c as usize] && !self.fired[c as usize] {
                     self.try_fire(c as usize)?;
                 }
             } else if let Some(v) = self.simple_vertex.pop() {
@@ -1567,7 +1591,10 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     tested.push(key);
-                    if self.disconnected_when_same(a, b) {
+                    let mut scratch = self.scratch.take().unwrap();
+                    let disconnected = self.disconnected_when_same(a, b, &mut scratch);
+                    self.scratch = Some(scratch);
+                    if disconnected {
                         opposites.push((a, b));
                     }
                 }
@@ -1579,7 +1606,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn disconnected_when_same(&self, a: Color, b: Color) -> bool {
+    fn disconnected_when_same(&self, a: Color, b: Color, scratch: &mut Scratch) -> bool {
         let t = self.t;
         // Colors in the hypothetical state where a and b are the same: b's class joins a's
         let delta = a.1 ^ b.1;
@@ -1587,8 +1614,17 @@ impl<'a> Engine<'a> {
         let half_edge_color = |h: u32| matched(self.color(t.he_face[h as usize]));
 
         // Half-edges of every edge of the faces of both classes (both parities)
-        let mut to_check: Vec<u32> = Vec::new();
-        let mut seen_half_edge = vec![false; t.num_half_edges];
+        let Scratch {
+            seen_half_edges,
+            removed,
+            visited,
+            cut,
+            to_check,
+            boundary,
+            stack,
+        } = scratch;
+        to_check.clear();
+        seen_half_edges.clear();
         for root in [a.0, b.0] {
             for &x in &self.color_members[root as usize] {
                 if x == self.outside {
@@ -1597,8 +1633,7 @@ impl<'a> Engine<'a> {
                 for &e in t.edges_of_face(x as usize) {
                     let h = t.edge_half_edge[e as usize];
                     for hh in [h, t.he_reversed[h as usize]] {
-                        if !seen_half_edge[hh as usize] {
-                            seen_half_edge[hh as usize] = true;
+                        if seen_half_edges.mark(hh) {
                             to_check.push(hh);
                         }
                     }
@@ -1606,12 +1641,11 @@ impl<'a> Engine<'a> {
             }
         }
 
-        let mut removed = vec![false; t.num_half_edges];
-        for &h0 in &to_check {
-            if removed[h0 as usize] {
+        removed.clear();
+        for &h0 in to_check.iter() {
+            if !removed.mark(h0) {
                 continue;
             }
-            removed[h0 as usize] = true;
             let exterior = half_edge_color(t.he_reversed[h0 as usize]);
             let interior = half_edge_color(h0);
             if exterior == interior {
@@ -1624,12 +1658,13 @@ impl<'a> Engine<'a> {
                 }
                 t.he_next[h as usize]
             };
-            let mut boundary = vec![h0];
+            boundary.clear();
+            boundary.push(h0);
             let mut h = next(h0);
             let mut steps = 0;
             while h != h0 {
                 boundary.push(h);
-                removed[h as usize] = true;
+                removed.mark(h);
                 h = next(h);
                 steps += 1;
                 if steps > t.num_half_edges {
@@ -1638,7 +1673,7 @@ impl<'a> Engine<'a> {
             }
             let mut exterior_faces: Vec<u32> = Vec::new();
             let mut interior_faces: Vec<u32> = Vec::new();
-            for &bh in &boundary {
+            for &bh in boundary.iter() {
                 let ef = t.he_face[t.he_reversed[bh as usize] as usize];
                 if !exterior_faces.contains(&ef) {
                     exterior_faces.push(ef);
@@ -1651,11 +1686,14 @@ impl<'a> Engine<'a> {
             if exterior_faces.len() == 1 {
                 continue;
             }
-            let cut: Vec<u32> = boundary.iter().map(|&bh| t.he_edge[bh as usize]).collect();
-            if !self.is_component(&exterior_faces, false, &cut, exterior, &matched) {
+            cut.clear();
+            for &bh in boundary.iter() {
+                cut.mark(t.he_edge[bh as usize]);
+            }
+            if !self.is_component(&exterior_faces, false, cut, visited, stack, exterior, &matched) {
                 continue;
             }
-            if self.is_component(&interior_faces, true, &cut, exterior, &matched) {
+            if self.is_component(&interior_faces, true, cut, visited, stack, exterior, &matched) {
                 return true;
             }
         }
@@ -1664,18 +1702,22 @@ impl<'a> Engine<'a> {
 
     // Flood fill from faces (NONE is the outside) without crossing the cut: whether it reaches a face with a positive
     // value, or two opposite colors (counting the exterior color as seen)
+    #[allow(clippy::too_many_arguments)]
     fn is_component(
         &self,
         initial: &[u32],
         call_on_initial: bool,
-        cut: &[u32],
+        cut: &Marks,
+        visited: &mut Marks,
+        stack: &mut Vec<u32>,
         exterior: Color,
         matched: &dyn Fn(Color) -> Color,
     ) -> bool {
         let t = self.t;
         let mut seen_colors: Vec<Color> = vec![exterior];
-        let mut visited = vec![false; t.num_faces + 1];
-        let index = |f: u32| if f == NONE { t.num_faces } else { f as usize };
+        visited.clear();
+        stack.clear();
+        let index = |f: u32| if f == NONE { t.num_faces as u32 } else { f };
         let check = |f: u32, seen_colors: &mut Vec<Color>| -> bool {
             if f != NONE {
                 let value = self.face_values[f as usize];
@@ -1690,10 +1732,8 @@ impl<'a> Engine<'a> {
             let opposite = (c.0, 1 - c.1);
             seen_colors.contains(&opposite)
         };
-        let mut stack: Vec<u32> = Vec::new();
         for &f in initial {
-            if !visited[index(f)] {
-                visited[index(f)] = true;
+            if visited.mark(index(f)) {
                 if call_on_initial && check(f, &mut seen_colors) {
                     return true;
                 }
@@ -1702,8 +1742,7 @@ impl<'a> Engine<'a> {
         }
         while let Some(f) = stack.pop() {
             let mut visit = |g: u32, stack: &mut Vec<u32>, seen_colors: &mut Vec<Color>| -> bool {
-                if !visited[index(g)] {
-                    visited[index(g)] = true;
+                if visited.mark(index(g)) {
                     if check(g, seen_colors) {
                         return true;
                     }
@@ -1713,22 +1752,22 @@ impl<'a> Engine<'a> {
             };
             if f == NONE {
                 for &e in &t.boundary_edges {
-                    if cut.contains(&e) {
+                    if cut.has(e) {
                         continue;
                     }
                     let [fa, fb] = t.faces_of_edge(e);
                     let g = if fa == NONE { fb } else { fa };
-                    if visit(g, &mut stack, &mut seen_colors) {
+                    if visit(g, stack, &mut seen_colors) {
                         return true;
                     }
                 }
             } else {
                 for &e in t.edges_of_face(f as usize) {
-                    if cut.contains(&e) {
+                    if cut.has(e) {
                         continue;
                     }
                     let g = t.other_face(e, f);
-                    if visit(g, &mut stack, &mut seen_colors) {
+                    if visit(g, stack, &mut seen_colors) {
                         return true;
                     }
                 }
@@ -1736,6 +1775,53 @@ impl<'a> Engine<'a> {
         }
         false
     }
+}
+
+// A set of indices that can be cleared in O(1)
+struct Marks {
+    marks: Vec<u32>,
+    stamp: u32,
+}
+
+impl Marks {
+    fn new(size: usize) -> Marks {
+        Marks {
+            marks: vec![0; size],
+            stamp: 1,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.stamp += 1;
+        if self.stamp == u32::MAX {
+            self.marks.fill(0);
+            self.stamp = 1;
+        }
+    }
+
+    // Whether it was newly marked
+    #[inline]
+    fn mark(&mut self, i: u32) -> bool {
+        let slot = &mut self.marks[i as usize];
+        let new = *slot != self.stamp;
+        *slot = self.stamp;
+        new
+    }
+
+    #[inline]
+    fn has(&self, i: u32) -> bool {
+        self.marks[i as usize] == self.stamp
+    }
+}
+
+struct Scratch {
+    seen_half_edges: Marks,
+    removed: Marks,
+    visited: Marks,
+    cut: Marks,
+    to_check: Vec<u32>,
+    boundary: Vec<u32>,
+    stack: Vec<u32>,
 }
 
 enum ParityAction {
@@ -1766,7 +1852,7 @@ pub mod profile {
     ];
 
     #[cfg(feature = "profile")]
-    pub static mut COUNTS: [u64; 4] = [0; 4];
+    pub static mut COUNTS: [u64; 8] = [0; 8];
 
     #[inline]
     pub fn count(_kind: usize) {

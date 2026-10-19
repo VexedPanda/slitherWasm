@@ -61,8 +61,18 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
   });
   const patternSectorToHalfEdge = positions.sectors.map((sector) => halfEdgeIndices.get(sector)!);
 
-  const data: number[] = [];
-  let clauseCount = 0;
+  const clauses = new Map<
+    string,
+    {
+      faceConditions: number[];
+      faces: number[];
+      body: number[];
+      head: Set<number>;
+      colorConditions: number[];
+      colorOutputs: Set<string>;
+      patternFaceCount: number;
+    }
+  >();
 
   for (const { group, size } of groups) {
     const collection = group.collection;
@@ -180,17 +190,89 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
           }
         }
 
-        data.push(faceConditions.length / 2, ...faceConditions);
-        data.push(faces.size, ...faces);
-        data.push(body.length, ...body);
-        data.push(head.length, ...head);
-        data.push(colorConditions.length / 3, ...colorConditions);
-        data.push(colorOutputs.length / 3, ...colorOutputs);
-        data.push(patternBoard.faces.length);
-        clauseCount++;
+        // Clauses with the same conditions (e.g. from a symmetric rule's equivalent embeddings) are merged, with their
+        // outputs combined
+        const sortedFaceConditions = sortedTuples(faceConditions, 2);
+        const sortedFaces = [...faces].sort((a, b) => a - b);
+        const sortedBody = [...new Set(body)].sort((a, b) => a - b);
+        const sortedColorConditions = sortedTuples(normalizedRelations(colorConditions), 3);
+        const key = [
+          sortedFaceConditions.join(','),
+          sortedFaces.join(','),
+          sortedBody.join(','),
+          sortedColorConditions.join(','),
+          patternBoard.faces.length,
+        ].join('|');
+        let clause = clauses.get(key);
+        if (!clause) {
+          clause = {
+            faceConditions: sortedFaceConditions,
+            faces: sortedFaces,
+            body: sortedBody,
+            head: new Set(),
+            colorConditions: sortedColorConditions,
+            colorOutputs: new Set(),
+            patternFaceCount: patternBoard.faces.length,
+          };
+          clauses.set(key, clause);
+        }
+        for (const atom of head) {
+          clause.head.add(atom);
+        }
+        const outputs = normalizedRelations(colorOutputs);
+        for (let i = 0; i < outputs.length; i += 3) {
+          clause.colorOutputs.add(`${outputs[i]},${outputs[i + 1]},${outputs[i + 2]}`);
+        }
       }
     }
   }
 
-  return { numSectors: board.halfEdges.length, clauses: new Uint32Array(data), clauseCount };
+  const data: number[] = [];
+  for (const clause of clauses.values()) {
+    const colorOutputs = [...clause.colorOutputs].flatMap((relation) => relation.split(',').map(Number));
+    pushAll(data, [clause.faceConditions.length / 2, ...clause.faceConditions]);
+    pushAll(data, [clause.faces.length, ...clause.faces]);
+    pushAll(data, [clause.body.length, ...clause.body]);
+    pushAll(data, [clause.head.size, ...clause.head]);
+    pushAll(data, [clause.colorConditions.length / 3, ...clause.colorConditions]);
+    pushAll(data, [colorOutputs.length / 3, ...colorOutputs]);
+    data.push(clause.patternFaceCount);
+  }
+
+  return { numSectors: board.halfEdges.length, clauses: new Uint32Array(data), clauseCount: clauses.size };
+};
+
+// (push(...values) can overflow the stack for long arrays)
+const pushAll = (target: number[], values: number[]) => {
+  for (const value of values) {
+    target.push(value);
+  }
+};
+
+// Flat tuples of the given size, deduplicated and sorted
+const sortedTuples = (flat: number[], size: number): number[] => {
+  const tuples: number[][] = [];
+  for (let i = 0; i < flat.length; i += size) {
+    tuples.push(flat.slice(i, i + size));
+  }
+  const unique = new Map(tuples.map((tuple) => [tuple.join(','), tuple]));
+  return [...unique.values()]
+    .sort((a, b) => {
+      for (let i = 0; i < size; i++) {
+        if (a[i] !== b[i]) {
+          return a[i] - b[i];
+        }
+      }
+      return 0;
+    })
+    .flat();
+};
+
+// Color relations (faceA, faceB, kind) with faceA <= faceB
+const normalizedRelations = (flat: number[]): number[] => {
+  const result: number[] = [];
+  for (let i = 0; i < flat.length; i += 3) {
+    result.push(Math.min(flat[i], flat[i + 1]), Math.max(flat[i], flat[i + 1]), flat[i + 2]);
+  }
+  return result;
 };
