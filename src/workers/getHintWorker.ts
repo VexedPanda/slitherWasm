@@ -20,5 +20,5 @@ export const getHintWorker = (): Worker => {
   return hintWorker!;
 };
 
-// Load on startup (for now)
-getHintWorker();
+// (Created on the first hint request rather than on startup: its pattern data takes memory that phones need, e.g. for
+// large boards)
