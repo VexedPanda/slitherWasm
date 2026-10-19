@@ -5,7 +5,6 @@
 import { PolygonGeneratorBoard } from '../src/model/board/core/PolygonGeneratorBoard.ts';
 import CanSolveDifficulty from '../src/model/generator/CanSolveDifficulty.ts';
 import { generateAdditiveConstrained } from '../src/model/generator/generateAdditiveConstrained.ts';
-import { serializeSolvedPuzzle } from '../src/model/generator/serializeSolvedPuzzle.ts';
 
 import { TinyEmitter, TinyProperty } from 'scenerystack/axon';
 import { dotRandom } from 'scenerystack/dot';
@@ -78,7 +77,13 @@ const generate = async (shortName: string, difficultyName: string, seed: number)
             board,
             difficulty,
             seed,
-            hash: hash(JSON.stringify(serializeSolvedPuzzle(puzzle))),
+            // The puzzle itself (clues and solution), not internal ids in its solved state
+            hash: hash(
+              JSON.stringify({
+                faces: puzzle.board.faces.map((face) => puzzle.cleanState.getFaceValue(face)),
+                solution: puzzle.board.edges.map((edge) => (puzzle.blackEdges.has(edge) ? 1 : 0)).join(''),
+              }),
+            ),
             canSolve,
             ms: Math.round(ms),
             canSolveMs: Math.round(canSolveMs),
@@ -93,6 +98,6 @@ const generate = async (shortName: string, difficultyName: string, seed: number)
     window.consistencyResult = results;
   } catch (e) {
     // @ts-expect-error
-    window.consistencyError = e instanceof Error ? e.stack ?? e.message : String(e);
+    window.consistencyError = e instanceof Error ? (e.stack ?? e.message) : String(e);
   }
 })();

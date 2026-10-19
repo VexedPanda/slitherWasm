@@ -12,12 +12,12 @@ import { GeneralSimpleRegionAction } from '../data/simple-region/GeneralSimpleRe
 import { TSimpleRegion, TSimpleRegionData } from '../data/simple-region/TSimpleRegionData.ts';
 import { TSolver } from './TSolver.ts';
 
-import { dotRandom } from 'scenerystack/dot';
-
 import _ from '../../workarounds/_.ts';
 
 // Oops, because on app restart, region IDs are persistent
-const getSimpleRegionGlobalId = (): number => dotRandom.nextInt(Number.MAX_SAFE_INTEGER);
+// Random (to be unique across saved and restored states), but not from dotRandom: puzzle generation uses dotRandom, so
+// it would then depend on how many simple regions its difficulty checks happen to create.
+const getSimpleRegionGlobalId = (): number => Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
 
 type Data = TFaceValueData & TEdgeStateData & TSimpleRegionData;
 

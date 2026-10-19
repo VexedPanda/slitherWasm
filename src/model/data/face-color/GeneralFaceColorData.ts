@@ -13,12 +13,13 @@ import FaceColorState, {
 } from './TFaceColorData.ts';
 
 import { TinyEmitter } from 'scenerystack/axon';
-import { dotRandom } from 'scenerystack/dot';
 
 import { MultiIterable } from '../../../workarounds/MultiIterable.ts';
 import assert, { assertEnabled } from '../../../workarounds/assert.ts';
 
-export const getFaceColorGlobalId = (): number => dotRandom.nextInt(Number.MAX_SAFE_INTEGER);
+// Random (to be unique across saved and restored states), but not from dotRandom: puzzle generation uses dotRandom, so
+// it would then depend on how many face colors its difficulty checks happen to create.
+export const getFaceColorGlobalId = (): number => Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
 
 export class GeneralFaceColorData implements TState<TFaceColorData> {
   public readonly faceColorsChangedEmitter = new TinyEmitter<
