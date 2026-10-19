@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   build:
+    # GitHub Pages needs a public repository (on this plan)
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

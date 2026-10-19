@@ -1,0 +1,216 @@
+/**
+ * Loop solver backed by the Rust/WebAssembly core (wasm/, built with `npm run build:wasm`).
+ *
+ * Boards are registered with the core once (cached per board) and each solve only passes face values and edge states,
+ * through linear memory.
+ */
+import { slitherCoreWasmBase64 } from './slitherCoreWasm.ts';
+
+import { TBoard } from '../model/board/core/TBoard.ts';
+import { TEdge } from '../model/board/core/TEdge.ts';
+import { TState } from '../model/data/core/TState.ts';
+import EdgeState from '../model/data/edge-state/EdgeState.ts';
+import { TEdgeStateData } from '../model/data/edge-state/TEdgeStateData.ts';
+import { TFaceValueData } from '../model/data/face-value/TFaceValueData.ts';
+
+type CoreExports = {
+  memory: WebAssembly.Memory;
+  alloc: (bytes: number) => number;
+  dealloc: (pointer: number, bytes: number) => void;
+  board_create: (
+    numVertices: number,
+    edgeVertices: number,
+    numEdges: number,
+    faceEdgeOffsets: number,
+    numFaces: number,
+    faceEdges: number,
+    numFaceEdges: number,
+  ) => number;
+  board_dispose: (handle: number) => void;
+  solve: (
+    handle: number,
+    faceValues: number,
+    edgeStates: number,
+    maxSolutions: number,
+    maxIterations: number,
+    conflictBudget: number,
+  ) => number;
+  output_pointer: () => number;
+  output_length: () => number;
+  last_conflicts: () => number;
+};
+
+let core: CoreExports | null = null;
+
+const decodeBase64 = (base64: string): Uint8Array => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const getCore = (): CoreExports => {
+  if (!core) {
+    // Synchronous, since solving is synchronous (the module is small enough for main-thread compilation)
+    const module = new WebAssembly.Module(decodeBase64(slitherCoreWasmBase64) as BufferSource);
+    core = new WebAssembly.Instance(module, {}).exports as unknown as CoreExports;
+  }
+  return core;
+};
+
+type CoreBoard = {
+  handle: number;
+  // Reused per-solve input buffers (in core memory)
+  faceValuesPointer: number;
+  edgeStatesPointer: number;
+};
+
+const boards = new WeakMap<TBoard, CoreBoard>();
+
+// Releases a board's core memory once the board is garbage collected (FinalizationRegistry isn't in our TS lib target)
+type HeldBoard = CoreBoard & { numFaces: number; numEdges: number };
+const FinalizationRegistryConstructor = (
+  globalThis as unknown as {
+    FinalizationRegistry?: new (cleanup: (held: HeldBoard) => void) => {
+      register: (target: object, held: HeldBoard) => void;
+    };
+  }
+).FinalizationRegistry;
+const registry =
+  FinalizationRegistryConstructor ?
+    new FinalizationRegistryConstructor((held) => {
+      const core = getCore();
+      core.board_dispose(held.handle);
+      core.dealloc(held.faceValuesPointer, held.numFaces);
+      core.dealloc(held.edgeStatesPointer, held.numEdges);
+    })
+  : null;
+
+const withU32Array = <T>(values: ArrayLike<number>, callback: (pointer: number) => T): T => {
+  const core = getCore();
+  const bytes = values.length * 4;
+  const pointer = core.alloc(bytes);
+  new Uint32Array(core.memory.buffer, pointer, values.length).set(values);
+  try {
+    return callback(pointer);
+  } finally {
+    core.dealloc(pointer, bytes);
+  }
+};
+
+const getCoreBoard = (board: TBoard): CoreBoard => {
+  let coreBoard = boards.get(board);
+  if (coreBoard) {
+    return coreBoard;
+  }
+
+  const core = getCore();
+  const vertexIndices = new Map(board.vertices.map((vertex, index) => [vertex, index]));
+  const edgeIndices = new Map(board.edges.map((edge, index) => [edge, index]));
+
+  const edgeVertices = new Uint32Array(board.edges.length * 2);
+  board.edges.forEach((edge, index) => {
+    edgeVertices[2 * index] = vertexIndices.get(edge.start)!;
+    edgeVertices[2 * index + 1] = vertexIndices.get(edge.end)!;
+  });
+
+  const faceEdgeOffsets = new Uint32Array(board.faces.length + 1);
+  const faceEdges: number[] = [];
+  board.faces.forEach((face, index) => {
+    for (const edge of face.edges) {
+      faceEdges.push(edgeIndices.get(edge)!);
+    }
+    faceEdgeOffsets[index + 1] = faceEdges.length;
+  });
+
+  const handle = withU32Array(edgeVertices, (edgeVerticesPointer) =>
+    withU32Array(faceEdgeOffsets, (faceEdgeOffsetsPointer) =>
+      withU32Array(faceEdges, (faceEdgesPointer) =>
+        core.board_create(
+          board.vertices.length,
+          edgeVerticesPointer,
+          board.edges.length,
+          faceEdgeOffsetsPointer,
+          board.faces.length,
+          faceEdgesPointer,
+          faceEdges.length,
+        ),
+      ),
+    ),
+  );
+
+  coreBoard = {
+    handle: handle,
+    faceValuesPointer: core.alloc(board.faces.length),
+    edgeStatesPointer: core.alloc(board.edges.length),
+  };
+  boards.set(board, coreBoard);
+  registry?.register(board, { ...coreBoard, numFaces: board.faces.length, numEdges: board.edges.length });
+  return coreBoard;
+};
+
+export const BUDGET_EXCEEDED = null;
+
+// Size of the core's linear memory (for profiling)
+export const getCoreMemoryBytes = (): number => getCore().memory.buffer.byteLength;
+
+// SAT conflicts in the last solve (for profiling)
+export const getLastSolveConflicts = (): number => getCore().last_conflicts();
+
+/**
+ * Finds up to maxSolutions solutions (each the edges of the loop, in loop order) for the state's face values and
+ * black/red edges, or returns BUDGET_EXCEEDED if it took more than maxIterations SAT models (each excluding the loops
+ * found) or conflictBudget conflicts.
+ */
+export const wasmSolve = (
+  board: TBoard,
+  state: TState<TEdgeStateData & TFaceValueData>,
+  maxSolutions: number,
+  maxIterations: number,
+  conflictBudget: number,
+): TEdge[][] | typeof BUDGET_EXCEEDED => {
+  const core = getCore();
+  const coreBoard = getCoreBoard(board);
+
+  // (Views are created after any allocation, since memory growth detaches old buffers)
+  const faceValues = new Int8Array(core.memory.buffer, coreBoard.faceValuesPointer, board.faces.length);
+  board.faces.forEach((face, index) => {
+    const value = state.getFaceValue(face);
+    faceValues[index] = value === null ? -1 : value;
+  });
+  const edgeStates = new Uint8Array(core.memory.buffer, coreBoard.edgeStatesPointer, board.edges.length);
+  board.edges.forEach((edge, index) => {
+    const edgeState = state.getEdgeState(edge);
+    edgeStates[index] =
+      edgeState === EdgeState.BLACK ? 1
+      : edgeState === EdgeState.RED ? 2
+      : 0;
+  });
+
+  const count = core.solve(
+    coreBoard.handle,
+    coreBoard.faceValuesPointer,
+    coreBoard.edgeStatesPointer,
+    maxSolutions,
+    maxIterations,
+    conflictBudget,
+  );
+  if (count < 0) {
+    return BUDGET_EXCEEDED;
+  }
+
+  const output = new Uint32Array(core.memory.buffer, core.output_pointer(), core.output_length());
+  const solutions: TEdge[][] = [];
+  let offset = 1;
+  for (let i = 0; i < count; i++) {
+    const length = output[offset++];
+    const solution: TEdge[] = new Array(length);
+    for (let j = 0; j < length; j++) {
+      solution[j] = board.edges[output[offset++]];
+    }
+    solutions.push(solution);
+  }
+  return solutions;
+};
