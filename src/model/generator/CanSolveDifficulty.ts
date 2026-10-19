@@ -27,10 +27,11 @@ import { Enumeration, EnumerationValue } from 'scenerystack/phet-core';
 
 type CanSolve = (board: TBoard, state: TState<TCompleteData>) => boolean;
 
-// EASY and MEDIUM are checked by the WebAssembly core (wasm/src/cansolve.rs), with the same rules as their TS solvers
-const wasmCanSolve = (difficulty: string, groups: RuleGroupLimit[]): CanSolve => {
+// EASY, MEDIUM and HARD are checked by the WebAssembly core (wasm/src/cansolve.rs, and wasm/src/engine.rs for HARD's
+// larger rule set), with the same rules as their TS solvers
+const wasmCanSolve = (difficulty: string, groups: RuleGroupLimit[], hard = false): CanSolve => {
   return (board, state) => {
-    const result = coreCanSolve(board, state, difficulty, () => compilePatternRules(board, groups));
+    const result = coreCanSolve(board, state, difficulty, () => compilePatternRules(board, groups), hard);
     if (result === null) {
       throw new InvalidStateError('Contradiction while checking difficulty');
     }
@@ -138,50 +139,61 @@ export default class CanSolveDifficulty extends EnumerationValue {
     ]),
   );
 
-  public static readonly HARD = new CanSolveDifficulty((board, state) => {
-    state = state.clone();
+  public static readonly HARD = new CanSolveDifficulty(
+    (board, state) => {
+      state = state.clone();
 
-    iterateSolverFactory(
-      (board: TBoard, state: TState<TCompleteData>, dirty?: boolean) => {
-        const boardPatternBoard = BoardPatternBoard.get(board);
+      iterateSolverFactory(
+        (board: TBoard, state: TState<TCompleteData>, dirty?: boolean) => {
+          const boardPatternBoard = BoardPatternBoard.get(board);
 
-        return new CompositeSolver<TCompleteData, TAnnotatedAction<TCompleteData>>([
-          new SafeEdgeToSimpleRegionSolver(board, state),
-          new SafeSolvedEdgeSolver(board, state),
-          new SafeEdgeToFaceColorSolver(board, state),
+          return new CompositeSolver<TCompleteData, TAnnotatedAction<TCompleteData>>([
+            new SafeEdgeToSimpleRegionSolver(board, state),
+            new SafeSolvedEdgeSolver(board, state),
+            new SafeEdgeToFaceColorSolver(board, state),
 
-          new SimpleVertexSolver(board, state, {
-            solveJointToRed: true,
-            solveForcedLineToBlack: true,
-            solveAlmostEmptyToRed: true,
-          }),
-          new SimpleFaceSolver(board, state, {
-            solveToRed: true,
-            solveToBlack: true,
-          }),
+            new SimpleVertexSolver(board, state, {
+              solveJointToRed: true,
+              solveForcedLineToBlack: true,
+              solveAlmostEmptyToRed: true,
+            }),
+            new SimpleFaceSolver(board, state, {
+              solveToRed: true,
+              solveToBlack: true,
+            }),
 
-          new SimpleLoopSolver(board, state, {
-            solveToRed: true,
-            solveToBlack: true,
-            resolveAllRegions: false, // NOTE: this will be faster
-          }),
+            new SimpleLoopSolver(board, state, {
+              solveToRed: true,
+              solveToBlack: true,
+              resolveAllRegions: false, // NOTE: this will be faster
+            }),
 
-          standardSolverFactory(board, state, dirty),
+            standardSolverFactory(board, state, dirty),
 
-          new FaceColorDisconnectionSolver(board, state),
+            new FaceColorDisconnectionSolver(board, state),
 
-          BinaryPatternSolver.fromGroup(board, boardPatternBoard, state, generalEdgeColorMixedGroup, 600),
-          BinaryPatternSolver.fromGroup(board, boardPatternBoard, state, generalEdgeSectorMixedGroup, 100),
-          BinaryPatternSolver.fromGroup(board, boardPatternBoard, state, generalEdgeMixedGroup, 1000),
-        ]);
-      },
-      board,
-      state,
+            BinaryPatternSolver.fromGroup(board, boardPatternBoard, state, generalEdgeColorMixedGroup, 600),
+            BinaryPatternSolver.fromGroup(board, boardPatternBoard, state, generalEdgeSectorMixedGroup, 100),
+            BinaryPatternSolver.fromGroup(board, boardPatternBoard, state, generalEdgeMixedGroup, 1000),
+          ]);
+        },
+        board,
+        state,
+        true,
+      );
+
+      return simpleRegionIsSolved(state);
+    },
+    wasmCanSolve(
+      'HARD',
+      [
+        { group: generalEdgeColorMixedGroup, size: 600 },
+        { group: generalEdgeSectorMixedGroup, size: 100 },
+        { group: generalEdgeMixedGroup, size: 1000 },
+      ],
       true,
-    );
-
-    return simpleRegionIsSolved(state);
-  });
+    ),
+  );
 
   public static readonly VERY_HARD = new CanSolveDifficulty((board, state) => {
     state = state.clone();

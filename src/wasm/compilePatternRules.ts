@@ -7,12 +7,17 @@
  * - the board faces the rule covers (for BinaryPatternSolver's separate face check, also fixed for a puzzle)
  * - body atoms: edge black/red and sector flag features that must all hold
  * - head atoms: the output features, set when the body holds
+ * - color conditions and color outputs (face color dual features): pairs of faces with the same or opposite colors
  *
- * Atoms are numbered: edge e black = 2e, edge e red = 2e + 1, then for pattern-board sector s: not zero = 2E + 3s,
- * not one = 2E + 3s + 1, not two = 2E + 3s + 2. "Only one" is "not zero" and "not two".
+ * Atoms are numbered: edge e black = 2e, edge e red = 2e + 1, then for sector (half-edge) h: not zero = 2E + 3h, not
+ * one = 2E + 3h + 1, not two = 2E + 3h + 2. "Only one" is "not zero" and "not two".
+ *
+ * Color relations are (faceA, faceB, kind) with kind 0 for same and 1 for opposite, where face F (the number of faces)
+ * is the outside.
  *
  * Each clause is encoded as: faceConditionCount, (face, value)..., faceCount, face..., bodyCount, atom..., headCount,
- * atom..., patternFaceCount. A face value of 0xff means "no value".
+ * atom..., colorConditionCount, (faceA, faceB, kind)..., colorOutputCount, (faceA, faceB, kind)..., patternFaceCount.
+ * A face value of 0xff means "no value".
  */
 import { TBoard } from '../model/board/core/TBoard.ts';
 import { BinaryMixedRuleGroup } from '../model/pattern/collection/BinaryMixedRuleGroup.ts';
@@ -44,7 +49,9 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
   const positions = getBoardFeaturePositions(boardPatternBoard);
   const boardEdgeIndices = new Map(board.edges.map((edge, index) => [edge, index]));
   const boardFaceIndices = new Map(board.faces.map((face, index) => [face, index]));
+  const halfEdgeIndices = new Map(board.halfEdges.map((halfEdge, index) => [halfEdge, index]));
   const numEdges = board.edges.length;
+  const outside = board.faces.length;
 
   // Pattern-board element index => board index
   const patternEdgeToEdge = positions.edges.map((edge) => boardEdgeIndices.get(edge)!);
@@ -52,6 +59,7 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
     const face = boardPatternBoard.getFace(patternFace);
     return face ? boardFaceIndices.get(face)! : -1;
   });
+  const patternSectorToHalfEdge = positions.sectors.map((sector) => halfEdgeIndices.get(sector)!);
 
   const data: number[] = [];
   let clauseCount = 0;
@@ -63,15 +71,30 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
       const mapping = getBinaryFeatureMapping(patternBoard);
       const bytes = collection.getRuleBytes(ruleIndex, false);
 
-      // Split into input and output feature bytes (each section ends with 0xff)
+      // Split into input and output feature bytes (each section ends with 0xff; face indices in face color dual
+      // sections are below 0xfe)
       const separator = bytes.indexOf(0xff);
-      const inputBytes = bytes.slice(0, separator);
-      const outputBytes = bytes.slice(separator + 1, bytes.length - 1);
-      if (inputBytes.includes(0xfe) || outputBytes.includes(0xfe)) {
-        throw new Error('Face color rules are not supported yet');
-      }
-      const inputFeatures = inputBytes.map((byte) => mapping.featureArray[byte]);
-      const outputFeatures = outputBytes.map((byte) => mapping.featureArray[byte]);
+      const parse = (sectionBytes: number[]) => {
+        const features: TEmbeddableFeature[] = [];
+        // Face color duals: [main primary face, then (pattern face, isSecondary) pairs]
+        const duals: { main: number; others: [number, boolean][] }[] = [];
+        for (let i = 0; i < sectionBytes.length; i++) {
+          const byte = sectionBytes[i];
+          if (byte === 0xfe) {
+            const dual = { main: sectionBytes[++i], others: [] as [number, boolean][] };
+            while (i + 1 < sectionBytes.length && sectionBytes[i + 1] !== 0xfe) {
+              const next = sectionBytes[++i];
+              dual.others.push([next & 0x7f, (next & 0x80) !== 0]);
+            }
+            duals.push(dual);
+          } else {
+            features.push(mapping.featureArray[byte]);
+          }
+        }
+        return { features, duals };
+      };
+      const input = parse(bytes.slice(0, separator));
+      const output = parse(bytes.slice(separator + 1, bytes.length - 1));
 
       for (const embedding of getEmbeddings(patternBoard, boardPatternBoard)) {
         const faceConditions: number[] = [];
@@ -80,7 +103,25 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
         let possible = true;
 
         const sectorAtom = (patternSectorIndex: number, flag: number) =>
-          2 * numEdges + 3 * embedding.mappedSectorIndices[patternSectorIndex] + flag;
+          2 * numEdges + 3 * patternSectorToHalfEdge[embedding.mappedSectorIndices[patternSectorIndex]] + flag;
+
+        // A rule pattern face's board face (the outside for none)
+        const mapFace = (patternFaceIndex: number) => {
+          const face = patternFaceToFace[embedding.mappedFaceIndices[patternBoard.faces[patternFaceIndex].index]];
+          return face === -1 ? outside : face;
+        };
+        const addColorRelations = (duals: { main: number; others: [number, boolean][] }[], relations: number[]) => {
+          for (const dual of duals) {
+            const main = mapFace(dual.main);
+            for (const [patternFaceIndex, isSecondary] of dual.others) {
+              relations.push(main, mapFace(patternFaceIndex), isSecondary ? 1 : 0);
+            }
+          }
+        };
+        const colorConditions: number[] = [];
+        const colorOutputs: number[] = [];
+        addColorRelations(input.duals, colorConditions);
+        addColorRelations(output.duals, colorOutputs);
 
         const addAtoms = (feature: TEmbeddableFeature, atoms: number[], isInput: boolean) => {
           if (feature instanceof FaceFeature) {
@@ -120,10 +161,10 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
           }
         };
 
-        for (const feature of inputFeatures) {
+        for (const feature of input.features) {
           addAtoms(feature, body, true);
         }
-        for (const feature of outputFeatures) {
+        for (const feature of output.features) {
           addAtoms(feature, head, false);
         }
         if (!possible) {
@@ -143,11 +184,13 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
         data.push(faces.size, ...faces);
         data.push(body.length, ...body);
         data.push(head.length, ...head);
+        data.push(colorConditions.length / 3, ...colorConditions);
+        data.push(colorOutputs.length / 3, ...colorOutputs);
         data.push(patternBoard.faces.length);
         clauseCount++;
       }
     }
   }
 
-  return { numSectors: positions.sectors.length, clauses: new Uint32Array(data), clauseCount };
+  return { numSectors: board.halfEdges.length, clauses: new Uint32Array(data), clauseCount };
 };

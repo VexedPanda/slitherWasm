@@ -47,6 +47,18 @@ type CoreExports = {
     clauseCount: number,
   ) => number;
   can_solve: (boardHandle: number, rulesHandle: number, faceValues: number) => number;
+  topology_create: (
+    numVertices: number,
+    numEdges: number,
+    numFaces: number,
+    halfEdges: number,
+    numHalfEdges: number,
+    vertexOffsets: number,
+    vertexIncoming: number,
+    faceOffsets: number,
+    faceHalfEdges: number,
+  ) => number;
+  can_solve_hard: (topologyHandle: number, rulesHandle: number, faceValues: number) => number;
 };
 
 let core: CoreExports | null = null;
@@ -225,6 +237,71 @@ export const wasmSolve = (
 };
 
 const rulesHandles = new WeakMap<TBoard, Map<string, number>>();
+const topologyHandles = new WeakMap<TBoard, number>();
+
+// The board's half-edge topology, in the TS board's orders (see wasm/src/topology.rs)
+const getTopologyHandle = (board: TBoard): number => {
+  let handle = topologyHandles.get(board);
+  if (handle === undefined) {
+    const core = getCore();
+    const vertexIndices = new Map(board.vertices.map((vertex, index) => [vertex, index]));
+    const edgeIndices = new Map(board.edges.map((edge, index) => [edge, index]));
+    const faceIndices = new Map(board.faces.map((face, index) => [face, index]));
+    const halfEdgeIndices = new Map(board.halfEdges.map((halfEdge, index) => [halfEdge, index]));
+
+    const halfEdges = new Uint32Array(board.halfEdges.length * 6);
+    board.halfEdges.forEach((halfEdge, index) => {
+      halfEdges.set(
+        [
+          vertexIndices.get(halfEdge.start)!,
+          vertexIndices.get(halfEdge.end)!,
+          edgeIndices.get(halfEdge.edge)!,
+          halfEdge.face ? faceIndices.get(halfEdge.face)! : 0xffffffff,
+          halfEdgeIndices.get(halfEdge.next)!,
+          halfEdgeIndices.get(halfEdge.reversed)!,
+        ],
+        index * 6,
+      );
+    });
+    const toCsr = <T>(items: T[], getList: (item: T) => unknown[]): [number[], number[]] => {
+      const offsets = [0];
+      const list: number[] = [];
+      for (const item of items) {
+        for (const halfEdge of getList(item)) {
+          list.push(halfEdgeIndices.get(halfEdge as TBoard['halfEdges'][number])!);
+        }
+        offsets.push(list.length);
+      }
+      return [offsets, list];
+    };
+    const [vertexOffsets, vertexIncoming] = toCsr(board.vertices, (vertex) => vertex.incomingHalfEdges);
+    const [faceOffsets, faceHalfEdges] = toCsr(board.faces, (face) => face.halfEdges);
+
+    handle = withU32Array(halfEdges, (halfEdgesPointer) =>
+      withU32Array(vertexOffsets, (vertexOffsetsPointer) =>
+        withU32Array(vertexIncoming, (vertexIncomingPointer) =>
+          withU32Array(faceOffsets, (faceOffsetsPointer) =>
+            withU32Array(faceHalfEdges, (faceHalfEdgesPointer) =>
+              core.topology_create(
+                board.vertices.length,
+                board.edges.length,
+                board.faces.length,
+                halfEdgesPointer,
+                board.halfEdges.length,
+                vertexOffsetsPointer,
+                vertexIncomingPointer,
+                faceOffsetsPointer,
+                faceHalfEdgesPointer,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    topologyHandles.set(board, handle);
+  }
+  return handle;
+};
 
 /**
  * Whether the deduction rules solve the puzzle from its face values (see wasm/src/cansolve.rs). The rules are compiled
@@ -235,6 +312,8 @@ export const wasmCanSolve = (
   state: TFaceValueData,
   rulesKey: string,
   getRules: () => CompiledRules,
+  // The HARD rule set (wasm/src/engine.rs), instead of EASY/MEDIUM's (wasm/src/cansolve.rs)
+  hard = false,
 ): boolean | null => {
   const core = getCore();
   const coreBoard = getCoreBoard(board);
@@ -259,6 +338,9 @@ export const wasmCanSolve = (
     faceValues[index] = value === null ? 0xff : value;
   });
 
-  const result = core.can_solve(coreBoard.handle, rulesHandle, coreBoard.faceValuesPointer);
+  const result =
+    hard ?
+      core.can_solve_hard(getTopologyHandle(board), rulesHandle, coreBoard.faceValuesPointer)
+    : core.can_solve(coreBoard.handle, rulesHandle, coreBoard.faceValuesPointer);
   return result < 0 ? null : result === 1;
 };

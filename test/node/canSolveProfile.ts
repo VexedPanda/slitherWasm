@@ -65,7 +65,8 @@ CompleteData.prototype.clone = function (this: CompleteData) {
 
 let canSolveMs = 0;
 let canSolveCalls = 0;
-const original = difficulty.canSolve;
+// Profile the TS solvers (the reference implementation)
+const original = difficulty.tsCanSolve;
 (difficulty as unknown as { canSolve: typeof original }).canSolve = (board, state) => {
   const start = performance.now();
   try {
