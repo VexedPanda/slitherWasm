@@ -17,19 +17,33 @@ const BLACK: u8 = 1;
 const RED: u8 = 2;
 
 pub struct RuleSet {
-    num_atoms: usize,
+    pub(crate) num_atoms: usize,
     // Per clause, offsets into the arrays below (CSR)
-    face_condition_offsets: Vec<u32>,
-    face_conditions: Vec<(u32, u8)>,
-    face_offsets: Vec<u32>,
-    faces: Vec<u32>,
+    pub(crate) face_condition_offsets: Vec<u32>,
+    pub(crate) face_conditions: Vec<(u32, u8)>,
+    pub(crate) face_offsets: Vec<u32>,
+    pub(crate) faces: Vec<u32>,
     body_offsets: Vec<u32>,
     head_offsets: Vec<u32>,
     atoms: Vec<u32>, // bodies and heads
-    pattern_face_counts: Vec<u32>,
+    pub(crate) pattern_face_counts: Vec<u32>,
     // Atom => clauses with it in their body (CSR)
-    watch_offsets: Vec<u32>,
-    watches: Vec<u32>,
+    pub(crate) watch_offsets: Vec<u32>,
+    pub(crate) watches: Vec<u32>,
+    // Face color relations (faceA, faceB, opposite) that must hold, and that are made to hold (CSR per clause), with the
+    // outside as face index num_faces
+    pub(crate) color_condition_offsets: Vec<u32>,
+    pub(crate) color_conditions: Vec<(u32, u32, bool)>,
+    pub(crate) color_output_offsets: Vec<u32>,
+    pub(crate) color_outputs: Vec<(u32, u32, bool)>,
+    // Node (face, or the outside) => clauses with a color condition on it (CSR)
+    color_watch_offsets: Vec<u32>,
+    color_watches: Vec<u32>,
+    // Clauses by one of their face conditions, as face * 256 + value (CSR over sorted keys), and those without any
+    first_condition_keys: Vec<u32>,
+    first_condition_offsets: Vec<u32>,
+    first_condition_clauses: Vec<u32>,
+    unconditioned_clauses: Vec<u32>,
 }
 
 impl RuleSet {
@@ -48,6 +62,16 @@ impl RuleSet {
             pattern_face_counts: Vec::with_capacity(clause_count),
             watch_offsets: Vec::new(),
             watches: Vec::new(),
+            color_condition_offsets: Vec::with_capacity(clause_count + 1),
+            color_conditions: Vec::new(),
+            color_output_offsets: Vec::with_capacity(clause_count + 1),
+            color_outputs: Vec::new(),
+            color_watch_offsets: Vec::new(),
+            color_watches: Vec::new(),
+            first_condition_keys: Vec::new(),
+            first_condition_offsets: Vec::new(),
+            first_condition_clauses: Vec::new(),
+            unconditioned_clauses: Vec::new(),
         };
         let mut i = 0;
         for _ in 0..clause_count {
@@ -77,9 +101,24 @@ impl RuleSet {
             rules.atoms.extend_from_slice(&data[i..i + count]);
             i += count;
 
+            for (offsets, relations) in [
+                (&mut rules.color_condition_offsets, &mut rules.color_conditions),
+                (&mut rules.color_output_offsets, &mut rules.color_outputs),
+            ] {
+                offsets.push(relations.len() as u32);
+                let count = data[i] as usize;
+                i += 1;
+                for _ in 0..count {
+                    relations.push((data[i], data[i + 1], data[i + 2] == 1));
+                    i += 3;
+                }
+            }
+
             rules.pattern_face_counts.push(data[i]);
             i += 1;
         }
+        rules.color_condition_offsets.push(rules.color_conditions.len() as u32);
+        rules.color_output_offsets.push(rules.color_outputs.len() as u32);
         rules.face_condition_offsets.push(rules.face_conditions.len() as u32);
         rules.face_offsets.push(rules.faces.len() as u32);
         rules.body_offsets.push(rules.atoms.len() as u32);
@@ -105,20 +144,121 @@ impl RuleSet {
             }
         }
         rules.watch_offsets = counts;
+
+        // Color watch lists
+        let num_nodes = rules
+            .color_conditions
+            .iter()
+            .map(|&(a, b, _)| a.max(b) as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut counts = vec![0u32; num_nodes + 1];
+        for c in 0..clause_count {
+            for &(a, b, _) in rules.color_conditions_of(c) {
+                counts[a as usize + 1] += 1;
+                if b != a {
+                    counts[b as usize + 1] += 1;
+                }
+            }
+        }
+        for x in 0..num_nodes {
+            counts[x + 1] += counts[x];
+        }
+        let mut fill = counts.clone();
+        let mut color_watches = vec![0; counts[num_nodes] as usize];
+        for c in 0..clause_count {
+            for k in rules.color_condition_offsets[c]..rules.color_condition_offsets[c + 1] {
+                let (a, b, _) = rules.color_conditions[k as usize];
+                for x in [a, b] {
+                    if x == b && a == b {
+                        continue;
+                    }
+                    color_watches[fill[x as usize] as usize] = c as u32;
+                    fill[x as usize] += 1;
+                }
+            }
+        }
+        rules.color_watch_offsets = counts;
+        rules.color_watches = color_watches;
+
+        // Index by first face condition
+        let mut keyed: Vec<(u32, u32)> = Vec::new();
+        for c in 0..clause_count {
+            let start = rules.face_condition_offsets[c] as usize;
+            let end = rules.face_condition_offsets[c + 1] as usize;
+            if start == end {
+                rules.unconditioned_clauses.push(c as u32);
+            } else {
+                // Prefer a condition on a face having a value (more selective than having none)
+                let conditions = &rules.face_conditions[start..end];
+                let &(f, value) = conditions
+                    .iter()
+                    .find(|&&(_, value)| value != NO_FACE_VALUE)
+                    .unwrap_or(&conditions[0]);
+                keyed.push((f * 256 + value as u32, c as u32));
+            }
+        }
+        keyed.sort_unstable();
+        for (i, &(key, c)) in keyed.iter().enumerate() {
+            if i == 0 || keyed[i - 1].0 != key {
+                rules.first_condition_keys.push(key);
+                rules.first_condition_offsets.push(i as u32);
+            }
+            rules.first_condition_clauses.push(c);
+        }
+        rules.first_condition_offsets.push(keyed.len() as u32);
         rules
     }
 
-    fn clause_count(&self) -> usize {
+    /// Clauses whose indexed face condition holds for these face values (or that have none); their other conditions still
+    /// need checking
+    pub(crate) fn candidate_clauses<'a>(&'a self, face_values: &'a [u8]) -> impl Iterator<Item = u32> + 'a {
+        let keyed = face_values.iter().enumerate().flat_map(move |(f, &value)| {
+            let key = f as u32 * 256 + value as u32;
+            match self.first_condition_keys.binary_search(&key) {
+                Ok(i) => {
+                    let (start, end) = (
+                        self.first_condition_offsets[i] as usize,
+                        self.first_condition_offsets[i + 1] as usize,
+                    );
+                    &self.first_condition_clauses[start..end]
+                }
+                Err(_) => &[][..],
+            }
+        });
+        self.unconditioned_clauses.iter().chain(keyed).copied()
+    }
+
+    #[inline]
+    pub(crate) fn color_watches_of(&self, x: u32) -> &[u32] {
+        let x = x as usize;
+        if x + 1 >= self.color_watch_offsets.len() {
+            return &[];
+        }
+        &self.color_watches[self.color_watch_offsets[x] as usize..self.color_watch_offsets[x + 1] as usize]
+    }
+
+    #[inline]
+    pub(crate) fn color_conditions_of(&self, c: usize) -> &[(u32, u32, bool)] {
+        &self.color_conditions[self.color_condition_offsets[c] as usize..self.color_condition_offsets[c + 1] as usize]
+    }
+
+    #[inline]
+    pub(crate) fn color_outputs_of(&self, c: usize) -> &[(u32, u32, bool)] {
+        &self.color_outputs[self.color_output_offsets[c] as usize..self.color_output_offsets[c + 1] as usize]
+    }
+
+    pub(crate) fn clause_count(&self) -> usize {
         self.pattern_face_counts.len()
     }
 
     #[inline]
-    fn body(&self, c: usize) -> &[u32] {
+    pub(crate) fn body(&self, c: usize) -> &[u32] {
         &self.atoms[self.body_offsets[c] as usize..self.head_offsets[c] as usize]
     }
 
     #[inline]
-    fn head(&self, c: usize) -> &[u32] {
+    pub(crate) fn head(&self, c: usize) -> &[u32] {
         &self.atoms[self.head_offsets[c] as usize..self.body_offsets[c + 1] as usize]
     }
 }
@@ -197,7 +337,8 @@ impl Checker<'_> {
         let nonzero_count = (0..board.num_faces as u32).filter(|&f| nonzero(f)).count();
         let spanning_count = self.quick_spanning_face_count();
 
-        for c in 0..rules.clause_count() {
+        for c in rules.candidate_clauses(self.face_values) {
+            let c = c as usize;
             let conditions = &rules.face_conditions
                 [rules.face_condition_offsets[c] as usize..rules.face_condition_offsets[c + 1] as usize];
             if !conditions

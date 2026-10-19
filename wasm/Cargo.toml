@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "Slitherlink loop solver compiled to WebAssembly"
 
+[features]
+# Time the HARD engine's rules (native builds only)
+profile = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

@@ -2,13 +2,16 @@
 //! linear memory: it allocates with `alloc`, writes, calls, reads, and frees with `dealloc`.
 
 pub mod cansolve;
+pub mod engine;
 pub mod sat;
 pub mod solver;
+pub mod topology;
 
 use solver::{Board, SolveResult};
 use std::cell::RefCell;
 
 thread_local! {
+    static TOPOLOGIES: RefCell<Vec<Option<topology::Topology>>> = const { RefCell::new(Vec::new()) };
     static RULE_SETS: RefCell<Vec<Option<cansolve::RuleSet>>> = const { RefCell::new(Vec::new()) };
     static BOARDS: RefCell<Vec<Option<Board>>> = const { RefCell::new(Vec::new()) };
     // Output of the last solve: [solution count, then for each solution its length and edge indices]
@@ -192,6 +195,68 @@ pub unsafe extern "C" fn can_solve(board_handle: u32, rules_handle: u32, face_va
             let sets = sets.borrow();
             let rules = sets[rules_handle as usize].as_ref().expect("disposed rules");
             match cansolve::can_solve(board, rules, face_values) {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(_) => -1,
+            }
+        })
+    })
+}
+
+/// Registers a board's half-edge topology (see topology.rs), returning its handle: per half-edge (start, end, edge,
+/// face or 0xffffffff, next, reversed), each vertex's incoming half-edges (CSR), each face's half-edges (CSR).
+///
+/// # Safety
+/// The pointers must reference u32 arrays of the given lengths.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn topology_create(
+    num_vertices: u32,
+    num_edges: u32,
+    num_faces: u32,
+    half_edges: *const u32,
+    num_half_edges: u32,
+    vertex_offsets: *const u32,
+    vertex_incoming: *const u32,
+    face_offsets: *const u32,
+    face_half_edges: *const u32,
+) -> u32 {
+    let (nv, nf, nh) = (num_vertices as usize, num_faces as usize, num_half_edges as usize);
+    let topology = unsafe {
+        topology::Topology::new(
+            nv,
+            num_edges as usize,
+            nf,
+            std::slice::from_raw_parts(half_edges, 6 * nh),
+            std::slice::from_raw_parts(vertex_offsets, nv + 1),
+            std::slice::from_raw_parts(vertex_incoming, nh),
+            std::slice::from_raw_parts(face_offsets, nf + 1),
+            std::slice::from_raw_parts(face_half_edges, *face_offsets.add(nf) as usize),
+        )
+    };
+    TOPOLOGIES.with(|topologies| {
+        let mut topologies = topologies.borrow_mut();
+        topologies.push(Some(topology));
+        (topologies.len() - 1) as u32
+    })
+}
+
+/// Whether the HARD rules solve the puzzle (see engine.rs): 1 if so, 0 if not, -1 on a contradiction.
+///
+/// # Safety
+/// `face_values` must have one entry per face.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn can_solve_hard(topology_handle: u32, rules_handle: u32, face_values: *const u8) -> i32 {
+    TOPOLOGIES.with(|topologies| {
+        let topologies = topologies.borrow();
+        let topology = topologies[topology_handle as usize]
+            .as_ref()
+            .expect("disposed topology");
+        let face_values = unsafe { std::slice::from_raw_parts(face_values, topology.num_faces) };
+        RULE_SETS.with(|sets| {
+            let sets = sets.borrow();
+            let rules = sets[rules_handle as usize].as_ref().expect("disposed rules");
+            match engine::can_solve_hard(topology, rules, face_values) {
                 Ok(true) => 1,
                 Ok(false) => 0,
                 Err(_) => -1,

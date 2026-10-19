@@ -7,6 +7,7 @@ import { PolygonGeneratorBoard } from '../../src/model/board/core/PolygonGenerat
 import { TBoard } from '../../src/model/board/core/TBoard.ts';
 import { polygonGenerators } from '../../src/model/board/generators/polygonGenerators.ts';
 import { CompleteData } from '../../src/model/data/combined/CompleteData.ts';
+import { generalEdgeColorMixedGroup } from '../../src/model/pattern/collection/generalEdgeColorMixedGroup.ts';
 import { generalEdgeMixedGroup } from '../../src/model/pattern/collection/generalEdgeMixedGroup.ts';
 import { generalEdgeSectorMixedGroup } from '../../src/model/pattern/collection/generalEdgeSectorMixedGroup.ts';
 import { RuleGroupLimit, compilePatternRules } from '../../src/wasm/compilePatternRules.ts';
@@ -34,13 +35,19 @@ const groups: Record<string, RuleGroupLimit[]> = {
     { group: generalEdgeSectorMixedGroup, size: 50 },
     { group: generalEdgeMixedGroup, size: 360 },
   ],
+  HARD: [
+    { group: generalEdgeColorMixedGroup, size: 600 },
+    { group: generalEdgeSectorMixedGroup, size: 100 },
+    { group: generalEdgeMixedGroup, size: 1000 },
+  ],
 };
+const only = process.argv[2];
 
 let compared = 0;
 let mismatches = 0;
 const start = performance.now();
 for (const c of cases) {
-  if (!groups[c.difficulty]) {
+  if (!groups[c.difficulty] || (only && c.difficulty !== only)) {
     continue;
   }
   const board = boardObjects[c.board];
@@ -48,7 +55,13 @@ for (const c of cases) {
     const character = c.faces[board.faces.indexOf(face)];
     return character === '.' ? null : Number(character);
   });
-  const result = wasmCanSolve(board, state, c.difficulty, () => compilePatternRules(board, groups[c.difficulty]));
+  const result = wasmCanSolve(
+    board,
+    state,
+    c.difficulty,
+    () => compilePatternRules(board, groups[c.difficulty]),
+    c.difficulty === 'HARD',
+  );
   compared++;
   if (result !== c.result) {
     mismatches++;
