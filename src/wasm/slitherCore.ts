@@ -153,6 +153,9 @@ const getCoreBoard = (board: TBoard): CoreBoard => {
 
 export const BUDGET_EXCEEDED = null;
 
+// Size of the core's linear memory (for profiling)
+export const getCoreMemoryBytes = (): number => getCore().memory.buffer.byteLength;
+
 // SAT conflicts in the last solve (for profiling)
 export const getLastSolveConflicts = (): number => getCore().last_conflicts();
 

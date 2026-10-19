@@ -88,7 +88,8 @@ export const satSolve = (
   state: TState<TEdgeStateData & TFaceValueData>,
   options: SatSolveOptions,
 ): TEdge[][] => {
-  const maxSolutions = options.failOnMultipleSolutions ? 2 : Number.MAX_SAFE_INTEGER;
+  // (a u32 in the core; maxIterations is what bounds it)
+  const maxSolutions = options.failOnMultipleSolutions ? 2 : 0xffffffff;
   const solutions = wasmSolve(board, state, maxSolutions, options.maxIterations, MAX_CONFLICTS);
 
   if (solutions === BUDGET_EXCEEDED) {

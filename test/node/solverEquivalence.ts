@@ -1,20 +1,27 @@
 /**
  * Checks that the WebAssembly solver finds the same number of solutions as the MiniSat-based satSolve, on random states
- * of several board types: node test/node/run.mjs test/node/solverEquivalence.ts [trials]
+ * of several board types, and on large generated puzzles: node test/node/run.mjs test/node/solverEquivalence.ts [trials]
+ * [comma-separated large sizes]
  */
 import { PolygonGeneratorBoard } from '../../src/model/board/core/PolygonGeneratorBoard.ts';
 import { TBoard } from '../../src/model/board/core/TBoard.ts';
 import { polygonGenerators } from '../../src/model/board/generators/polygonGenerators.ts';
 import { CompleteData } from '../../src/model/data/combined/CompleteData.ts';
 import EdgeState from '../../src/model/data/edge-state/EdgeState.ts';
+import CanSolveDifficulty from '../../src/model/generator/CanSolveDifficulty.ts';
+import { generateAdditiveConstrained } from '../../src/model/generator/generateAdditiveConstrained.ts';
 import { generateFaceAdditive } from '../../src/model/generator/generateFaceAdditive.ts';
 import { satSolveMiniSat as satSolve } from '../../src/model/solver/MiniSatSolver.ts';
 import { MaximumSolverIterationsError } from '../../src/model/solver/errors/MaximumSolverIterationsError.ts';
 import { wasmSolve } from '../../src/wasm/slitherCore.ts';
 
+import { TinyEmitter, TinyProperty } from 'scenerystack/axon';
 import { dotRandom } from 'scenerystack/dot';
 
 const trials = Number(process.argv[2] ?? 200);
+// Also generate a few large puzzles with the WebAssembly solver, and check MiniSat agrees they're unique (CDCL bugs, e.g.
+// in learnt clause reduction, only show up after many conflicts, which the small boards above never reach)
+const largeSizes = (process.argv[3] ?? '').split(',').filter(Boolean).map(Number);
 
 const boards: { name: string; board: TBoard }[] = [];
 for (const [name, parameters] of [
@@ -127,6 +134,34 @@ for (let trial = 0; trial < trials; trial++) {
     }
     mismatches++;
     console.log(`MISMATCH on ${name}: satSolve ${expected} (${valid.length} valid), wasm ${actual}`);
+  }
+}
+
+for (const size of largeSizes) {
+  const board = PolygonGeneratorBoard.get(
+    polygonGenerators.find((g) => g.name === 'Square')!,
+    {
+      width: size,
+      height: size,
+    },
+  );
+  const puzzle = await generateAdditiveConstrained(
+    board,
+    CanSolveDifficulty.NO_LIMIT,
+    new TinyProperty(false),
+    new TinyEmitter(),
+    new TinyEmitter(),
+    new TinyEmitter(),
+  );
+  const expected = satSolve(board, puzzle!.cleanState, { maxIterations: 10000, failOnMultipleSolutions: false });
+  const same =
+    expected.length === 1 &&
+    expected[0].length === puzzle!.blackEdges.size &&
+    expected[0].every((edge) => puzzle!.blackEdges.has(edge));
+  compared++;
+  if (!same) {
+    mismatches++;
+    console.log(`MISMATCH on generated ${size}x${size}: MiniSat finds ${expected.length} solutions`);
   }
 }
 

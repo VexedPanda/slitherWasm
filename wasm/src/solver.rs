@@ -180,8 +180,7 @@ pub fn solve(
     }
 
     // Exactly the value's number of edges around each face with a value
-    for f in 0..board.num_faces {
-        let value = face_values[f];
+    for (f, &value) in face_values.iter().enumerate().take(board.num_faces) {
         if value == NO_VALUE {
             continue;
         }
