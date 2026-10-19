@@ -27,10 +27,17 @@ type CoreExports = {
     numFaceEdges: number,
   ) => number;
   board_dispose: (handle: number) => void;
-  solve: (handle: number, faceValues: number, edgeStates: number, maxSolutions: number, nodeBudget: number) => number;
+  solve: (
+    handle: number,
+    faceValues: number,
+    edgeStates: number,
+    maxSolutions: number,
+    maxIterations: number,
+    conflictBudget: number,
+  ) => number;
   output_pointer: () => number;
   output_length: () => number;
-  last_nodes: () => number;
+  last_conflicts: () => number;
 };
 
 let core: CoreExports | null = null;
@@ -146,18 +153,20 @@ const getCoreBoard = (board: TBoard): CoreBoard => {
 
 export const BUDGET_EXCEEDED = null;
 
-// Search nodes used by the last solve (for profiling)
-export const getLastSolveNodes = (): number => getCore().last_nodes();
+// SAT conflicts in the last solve (for profiling)
+export const getLastSolveConflicts = (): number => getCore().last_conflicts();
 
 /**
  * Finds up to maxSolutions solutions (each the edges of the loop, in loop order) for the state's face values and
- * black/red edges, or returns BUDGET_EXCEEDED if the search ran out of its node budget.
+ * black/red edges, or returns BUDGET_EXCEEDED if it took more than maxIterations SAT models (each excluding the loops
+ * found) or conflictBudget conflicts.
  */
 export const wasmSolve = (
   board: TBoard,
   state: TState<TEdgeStateData & TFaceValueData>,
   maxSolutions: number,
-  nodeBudget: number,
+  maxIterations: number,
+  conflictBudget: number,
 ): TEdge[][] | typeof BUDGET_EXCEEDED => {
   const core = getCore();
   const coreBoard = getCoreBoard(board);
@@ -182,7 +191,8 @@ export const wasmSolve = (
     coreBoard.faceValuesPointer,
     coreBoard.edgeStatesPointer,
     maxSolutions,
-    nodeBudget,
+    maxIterations,
+    conflictBudget,
   );
   if (count < 0) {
     return BUDGET_EXCEEDED;

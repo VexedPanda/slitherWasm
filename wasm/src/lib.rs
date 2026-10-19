@@ -1,9 +1,10 @@
 //! WebAssembly exports for the Slitherlink core. The JS side (src/wasm/slitherCore.ts) passes flat typed arrays through
 //! linear memory: it allocates with `alloc`, writes, calls, reads, and frees with `dealloc`.
 
+pub mod sat;
 pub mod solver;
 
-use solver::{Board, SolveResult, Solver};
+use solver::{Board, SolveResult};
 use std::cell::RefCell;
 
 thread_local! {
@@ -73,7 +74,8 @@ pub extern "C" fn board_dispose(handle: u32) {
     });
 }
 
-/// Finds up to `max_solutions` solutions. Returns the number found, or -1 if the node budget ran out. The solutions are
+/// Finds up to `max_solutions` solutions. Returns the number found, or -1 if it gave up (more than `max_iterations`
+/// SAT models, or `conflict_budget` conflicts). The solutions are
 /// then available via `output_pointer`/`output_length`.
 ///
 /// # Safety
@@ -85,7 +87,8 @@ pub unsafe extern "C" fn solve(
     face_values: *const i8,
     edge_states: *const u8,
     max_solutions: u32,
-    node_budget: f64,
+    max_iterations: f64,
+    conflict_budget: f64,
 ) -> i32 {
     BOARDS.with(|boards| {
         let boards = boards.borrow();
@@ -96,8 +99,15 @@ pub unsafe extern "C" fn solve(
                 std::slice::from_raw_parts(edge_states, board.num_edges),
             )
         };
-        let (result, nodes) = Solver::solve(board, face_values, edge_states, max_solutions as usize, node_budget as u64);
-        unsafe { LAST_NODES = nodes as f64 };
+        let (result, conflicts) = solver::solve(
+            board,
+            face_values,
+            edge_states,
+            max_solutions as usize,
+            max_iterations as u64,
+            conflict_budget as u64,
+        );
+        unsafe { LAST_CONFLICTS = conflicts as f64 };
         OUTPUT.with(|output| {
             let mut output = output.borrow_mut();
             output.clear();
@@ -116,12 +126,12 @@ pub unsafe extern "C" fn solve(
     })
 }
 
-static mut LAST_NODES: f64 = 0.0;
+static mut LAST_CONFLICTS: f64 = 0.0;
 
-/// Search nodes used by the last solve (for profiling)
+/// SAT conflicts in the last solve (for profiling)
 #[unsafe(no_mangle)]
-pub extern "C" fn last_nodes() -> f64 {
-    unsafe { LAST_NODES }
+pub extern "C" fn last_conflicts() -> f64 {
+    unsafe { LAST_CONFLICTS }
 }
 
 #[unsafe(no_mangle)]

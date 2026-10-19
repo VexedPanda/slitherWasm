@@ -86,8 +86,23 @@ for (let trial = 0; trial < trials; trial++) {
   if (expected === null) {
     continue;
   }
-  const solutions = wasmSolve(board, state, 3, 1e9);
+  const solutions = wasmSolve(board, state, 3, 10000, 1e12);
   const actual = solutions === null ? -1 : solutions.length;
+
+  // Generation asks for at most two (whether the puzzle is unique), which takes a different search path
+  const firstTwo = wasmSolve(board, state, 2, 10000, 1e12);
+  if (firstTwo === null || firstTwo.length !== Math.min(actual, 2)) {
+    mismatches++;
+    console.log(`MISMATCH (two) on ${name}: ${firstTwo?.length} of ${actual}`);
+  }
+  if (
+    firstTwo?.length === 2 &&
+    firstTwo[0].length === firstTwo[1].length &&
+    firstTwo[0].every((e) => firstTwo[1].includes(e))
+  ) {
+    mismatches++;
+    console.log(`DUPLICATE solution on ${name}`);
+  }
 
   compared++;
   counts[Math.min(expected, 3)]++;

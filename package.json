@@ -9,7 +9,8 @@
     "preview": "vite preview --host=0.0.0.0",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p .",
-    "build:wasm": "node bin/build-wasm.js"
+    "build:wasm": "node bin/build-wasm.js",
+    "test:solver": "node test/node/run.mjs test/node/solverEquivalence.ts 400"
   },
   "dependencies": {
     "@techstark/opencv-js": "5.0.0-release.1",

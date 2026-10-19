@@ -80,18 +80,18 @@ export type SatSolveOptions = {
 /**
  * Finds the solutions (each the edges of a single loop) for the state's face values and black/red edges, with the
  * WebAssembly solver (src/wasm/slitherCore.ts). With failOnMultipleSolutions, throws MultipleSolutionsError once a second
- * solution is found. Throws MaximumSolverIterationsError if there are more than maxIterations solutions, or the search
- * takes too long.
+ * solution is found. Throws MaximumSolverIterationsError if it takes more than maxIterations SAT models (as the
+ * MiniSat-based solver did).
  */
 export const satSolve = (
   board: TBoard,
   state: TState<TEdgeStateData & TFaceValueData>,
   options: SatSolveOptions,
 ): TEdge[][] => {
-  const maxSolutions = options.failOnMultipleSolutions ? 2 : options.maxIterations + 1;
-  const solutions = wasmSolve(board, state, maxSolutions, options.maxIterations * NODES_PER_ITERATION);
+  const maxSolutions = options.failOnMultipleSolutions ? 2 : Number.MAX_SAFE_INTEGER;
+  const solutions = wasmSolve(board, state, maxSolutions, options.maxIterations, MAX_CONFLICTS);
 
-  if (solutions === BUDGET_EXCEEDED || solutions.length > options.maxIterations) {
+  if (solutions === BUDGET_EXCEEDED) {
     throw new MaximumSolverIterationsError();
   }
   if (options.failOnMultipleSolutions && solutions.length > 1) {
@@ -100,5 +100,5 @@ export const satSolve = (
   return solutions;
 };
 
-// Search budget per allowed iteration of the MiniSat-based solver (each of its iterations is a full SAT solve)
-const NODES_PER_ITERATION = 10000;
+// Effectively unlimited (MiniSat had no conflict limit either); the iteration limit is what bounds a solve
+const MAX_CONFLICTS = 1e12;
