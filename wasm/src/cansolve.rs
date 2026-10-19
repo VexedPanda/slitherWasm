@@ -27,6 +27,8 @@ pub struct RuleSet {
     head_offsets: Vec<u32>,
     atoms: Vec<u32>, // bodies and heads
     pub(crate) pattern_face_counts: Vec<u32>,
+    // The largest of those (with more spanning faces than this, the face check never applies)
+    pub(crate) max_pattern_face_count: usize,
     // Atom => clauses with it in their body (CSR)
     pub(crate) watch_offsets: Vec<u32>,
     pub(crate) watches: Vec<u32>,
@@ -59,6 +61,7 @@ impl RuleSet {
             head_offsets: Vec::with_capacity(clause_count + 1),
             atoms: Vec::new(),
             pattern_face_counts: Vec::with_capacity(clause_count),
+            max_pattern_face_count: 0,
             watch_offsets: Vec::new(),
             watches: Vec::new(),
             color_condition_offsets: Vec::with_capacity(clause_count + 1),
@@ -112,6 +115,7 @@ impl RuleSet {
             }
 
             rules.pattern_face_counts.push(data[i]);
+            rules.max_pattern_face_count = rules.max_pattern_face_count.max(data[i] as usize);
             i += 1;
         }
         rules.color_condition_offsets.push(rules.color_conditions.len() as u32);
@@ -173,6 +177,18 @@ impl RuleSet {
 
     /// Clauses whose indexed face condition holds for these face values (or that have none); their other conditions still
     /// need checking
+    /// Clauses whose indexed (first) face condition is this face having this value
+    pub(crate) fn keyed_clauses(&self, f: usize, value: u8) -> &[u32] {
+        let key = f as u32 * 256 + value as u32;
+        match self.first_condition_keys.binary_search(&key) {
+            Ok(i) => {
+                &self.first_condition_clauses
+                    [self.first_condition_offsets[i] as usize..self.first_condition_offsets[i + 1] as usize]
+            }
+            Err(_) => &[],
+        }
+    }
+
     pub(crate) fn candidate_clauses<'a>(&'a self, face_values: &'a [u8]) -> impl Iterator<Item = u32> + 'a {
         let keyed = face_values.iter().enumerate().flat_map(move |(f, &value)| {
             let key = f as u32 * 256 + value as u32;
@@ -260,35 +276,143 @@ pub struct Deduction {
 /// loops by SimpleLoopSolver's "solve to black", and the rules should have no highlander rules), so if that solves the
 /// puzzle, it's unique.
 pub fn deduce(board: &Board, rules: &RuleSet, face_values: &[u8], sound: bool) -> Result<Deduction, Invalid> {
-    let mut checker = Checker {
+    let mut checker = Checker::new(board, rules, face_values, sound);
+    checker.init_clauses(None)?;
+    checker.run()?;
+    Ok(Deduction {
+        solved: checker.is_solved(),
+        edge_state: checker.edge_state,
+    })
+}
+
+/// The deduction state for a puzzle's values with some faces' values held back (and every clause with a face condition
+/// on those faces), to continue from for values that only differ on those faces (see deduce_from). Its deductions hold
+/// for any such values (the rules are monotone once the face check can't apply: more values only enable more), so
+/// continuing from it gives the same result as deducing from scratch, with much less work when the faces are few.
+pub struct Checkpoint {
+    sound: bool,
+    faces: Vec<bool>,
+    deferred: Vec<u32>,
+    edge_state: Vec<u8>,
+    atom_true: Vec<bool>,
+    remaining: Vec<u32>,
+    alive: Vec<bool>,
+    vblack: Vec<u8>,
+    vwhite: Vec<u8>,
+    fblack: Vec<u8>,
+    fred: Vec<u8>,
+    partner: Vec<u32>,
+    closed_loops: u32,
+}
+
+/// A Checkpoint for these values without those on `faces`. None when that's invalid, or when the values are too few for
+/// the rules' face check to be ignored (that check isn't monotone).
+pub fn checkpoint(
+    board: &Board,
+    rules: &RuleSet,
+    face_values: &[u8],
+    faces: &[bool],
+    sound: bool,
+) -> Option<Checkpoint> {
+    let held: Vec<u8> = face_values
+        .iter()
+        .zip(faces)
+        .map(|(&value, &held)| if held { NO_FACE_VALUE } else { value })
+        .collect();
+    let mut checker = Checker::new(board, rules, &held, sound);
+    if checker.quick_spanning_face_count() <= rules.max_pattern_face_count {
+        return None;
+    }
+    // Clauses whose indexed face condition is on a held face (any value) are deferred too
+    let mut deferred = Vec::new();
+    for (f, &h) in faces.iter().enumerate() {
+        if h {
+            for value in (0..=board.face_edge_count(f) as u8).chain([NO_FACE_VALUE]) {
+                deferred.extend_from_slice(rules.keyed_clauses(f, value));
+            }
+        }
+    }
+    checker.init_clauses(Some((faces, &mut deferred))).ok()?;
+    checker.run().ok()?;
+    deferred.sort_unstable();
+    deferred.dedup();
+    Some(Checkpoint {
         sound,
+        faces: faces.to_vec(),
+        deferred,
+        edge_state: checker.edge_state,
+        atom_true: checker.atom_true,
+        remaining: checker.remaining,
+        alive: checker.alive,
+        vblack: checker.vblack,
+        vwhite: checker.vwhite,
+        fblack: checker.fblack,
+        fred: checker.fred,
+        partner: checker.partner,
+        closed_loops: checker.closed_loops,
+    })
+}
+
+/// deduce, continuing from a checkpoint: `face_values` must match the checkpoint's values except on its held faces
+pub fn deduce_from(
+    checkpoint: &Checkpoint,
+    board: &Board,
+    rules: &RuleSet,
+    face_values: &[u8],
+) -> Result<Deduction, Invalid> {
+    let mut checker = Checker {
+        sound: checkpoint.sound,
         board,
         rules,
         face_values,
-        edge_state: vec![WHITE; board.num_edges],
-        atom_true: vec![false; rules.num_atoms],
+        edge_state: checkpoint.edge_state.clone(),
+        atom_true: checkpoint.atom_true.clone(),
         atom_queue: Vec::new(),
-        remaining: vec![0; rules.clause_count()],
-        alive: vec![false; rules.clause_count()],
-        vblack: vec![0; board.num_vertices],
-        vwhite: (0..board.num_vertices).map(|v| board.vertex_degree(v) as u8).collect(),
-        fblack: vec![0; board.num_faces],
-        fred: vec![0; board.num_faces],
-        vertex_queue: (0..board.num_vertices as u32).collect(),
-        in_vertex_queue: vec![true; board.num_vertices],
+        remaining: checkpoint.remaining.clone(),
+        alive: checkpoint.alive.clone(),
+        vblack: checkpoint.vblack.clone(),
+        vwhite: checkpoint.vwhite.clone(),
+        fblack: checkpoint.fblack.clone(),
+        fred: checkpoint.fred.clone(),
+        vertex_queue: Vec::new(),
+        in_vertex_queue: vec![false; board.num_vertices],
         face_queue: Vec::new(),
         in_face_queue: vec![false; board.num_faces],
-        partner: (0..board.num_vertices as u32).collect(),
-        closed_loops: 0,
+        partner: checkpoint.partner.clone(),
+        closed_loops: checkpoint.closed_loops,
         changed_since_loop_scan: true,
     };
-    for (f, &value) in face_values.iter().enumerate() {
-        if value != NO_FACE_VALUE {
-            checker.face_queue.push(f as u32);
-            checker.in_face_queue[f] = true;
+    if checker.quick_spanning_face_count() <= rules.max_pattern_face_count {
+        return deduce(board, rules, face_values, checkpoint.sound);
+    }
+    // The held faces' clauses that apply (counting their conditions that don't hold yet), then their faces' rules
+    let mut ready = Vec::new();
+    for &c in &checkpoint.deferred {
+        let c = c as usize;
+        let conditions = &rules.face_conditions
+            [rules.face_condition_offsets[c] as usize..rules.face_condition_offsets[c + 1] as usize];
+        if !conditions.iter().all(|&(f, value)| face_values[f as usize] == value) {
+            continue;
+        }
+        checker.alive[c] = true;
+        let remaining = rules
+            .body(c)
+            .iter()
+            .filter(|&&a| !checker.atom_true[a as usize])
+            .count() as u32;
+        checker.remaining[c] = remaining;
+        if remaining == 0 {
+            ready.push(c);
         }
     }
-    checker.init_clauses()?;
+    for c in ready {
+        checker.fire(c)?;
+    }
+    for (f, &held) in checkpoint.faces.iter().enumerate() {
+        if held {
+            checker.enqueue_face(f as u32);
+        }
+    }
     checker.run()?;
     Ok(Deduction {
         solved: checker.is_solved(),
@@ -297,9 +421,43 @@ pub fn deduce(board: &Board, rules: &RuleSet, face_values: &[u8], sound: bool) -
 }
 
 impl Checker<'_> {
+    fn new<'a>(board: &'a Board, rules: &'a RuleSet, face_values: &'a [u8], sound: bool) -> Checker<'a> {
+        let mut checker = Checker {
+            sound,
+            board,
+            rules,
+            face_values,
+            edge_state: vec![WHITE; board.num_edges],
+            atom_true: vec![false; rules.num_atoms],
+            atom_queue: Vec::new(),
+            remaining: vec![0; rules.clause_count()],
+            alive: vec![false; rules.clause_count()],
+            vblack: vec![0; board.num_vertices],
+            vwhite: (0..board.num_vertices).map(|v| board.vertex_degree(v) as u8).collect(),
+            fblack: vec![0; board.num_faces],
+            fred: vec![0; board.num_faces],
+            vertex_queue: (0..board.num_vertices as u32).collect(),
+            in_vertex_queue: vec![true; board.num_vertices],
+            face_queue: Vec::new(),
+            in_face_queue: vec![false; board.num_faces],
+            partner: (0..board.num_vertices as u32).collect(),
+            closed_loops: 0,
+            changed_since_loop_scan: true,
+        };
+        for (f, &value) in face_values.iter().enumerate() {
+            if value != NO_FACE_VALUE {
+                checker.face_queue.push(f as u32);
+                checker.in_face_queue[f] = true;
+            }
+        }
+        checker
+    }
+
     // Which clauses can apply for this puzzle (face conditions, and BinaryPatternSolver's separate face check), firing
     // those with nothing left to wait for
-    fn init_clauses(&mut self) -> Result<(), Invalid> {
+    // With `deferred` (faces, and the clauses to collect): clauses with a face condition on those faces are skipped and
+    // collected instead (see Checkpoint)
+    fn init_clauses(&mut self, mut deferred: Option<(&[bool], &mut Vec<u32>)>) -> Result<(), Invalid> {
         let board = self.board;
         let rules = self.rules;
         let nonzero = |f: u32| {
@@ -313,6 +471,12 @@ impl Checker<'_> {
             let c = c as usize;
             let conditions = &rules.face_conditions
                 [rules.face_condition_offsets[c] as usize..rules.face_condition_offsets[c + 1] as usize];
+            if let Some((faces, clauses)) = &mut deferred
+                && conditions.iter().any(|&(f, _)| faces[f as usize])
+            {
+                clauses.push(c as u32);
+                continue;
+            }
             if !conditions
                 .iter()
                 .all(|&(f, value)| self.face_values[f as usize] == value)

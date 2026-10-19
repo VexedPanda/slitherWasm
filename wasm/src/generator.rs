@@ -34,6 +34,12 @@ pub enum Check {
 // Most recent loops are checked first, and the oldest are dropped past this (as in KnownSolutions.ts)
 const MAX_KNOWN_SOLUTIONS: usize = 200;
 // Models tried while looking for another solution, before using the last one (not a solution) as the next witness
+// Random loops: one in this many faces next to the growing region is kept outside, and regions smaller than 1/this of
+// the board are retried
+const LOOP_OUTSIDE_ODDS: u64 = 3;
+const LOOP_MIN_INSIDE_DIVISOR: usize = 3;
+// Faces per minimization cluster (see Generator::cluster_order)
+const MINIMIZE_CLUSTER_SIZE: usize = 32;
 const WITNESS_ROUNDS: u64 = 256;
 // The most values added at once from a witness solution
 const MAX_WITNESS_VALUES: usize = 256;
@@ -92,6 +98,8 @@ enum Phase {
 
 pub struct Generator {
     check: Check,
+    // With sound rules: start from a random board-filling loop and add its values until they solve it (no SAT counting)
+    loop_first: bool,
     rng: u64,
     face_values: Vec<u8>,
     // The solution's edges (once the puzzle is unique)
@@ -108,6 +116,10 @@ pub struct Generator {
     counter: Option<SolutionCounter>,
     // Values to try removing at once while minimizing
     block: usize,
+    // Loop-first minimization goes through clusters of nearby faces (ending at these positions), checking removals from
+    // a checkpoint of the deduction without the current cluster's values (see cansolve::Checkpoint)
+    cluster_ends: Vec<usize>,
+    checkpoint: Option<(usize, cansolve::Checkpoint)>,
     // Two solutions of the current values, while adding values (the second may instead be a model with several loops,
     // in which case only the first is a solution)
     witnesses: Option<(Vec<u32>, Vec<u32>)>,
@@ -126,6 +138,7 @@ impl Generator {
     ) -> Generator {
         let mut generator = Generator {
             check,
+            loop_first: rules.sound.is_some(),
             rng: seed | 1,
             face_values: vec![NO_VALUE; board.num_faces],
             solution: Vec::new(),
@@ -137,6 +150,8 @@ impl Generator {
             uniqueness: None,
             counter: None,
             block: 1,
+            cluster_ends: Vec::new(),
+            checkpoint: None,
             witnesses: None,
             second_witness_is_solution: true,
         };
@@ -196,7 +211,7 @@ impl Generator {
                     .filter(|&f| minimized[f as usize].is_none())
                     .collect();
                 self.shuffle(&mut order);
-                self.start_minimize(order);
+                self.start_minimize(board, order);
                 return;
             }
             // Couldn't resume
@@ -204,7 +219,10 @@ impl Generator {
             defined.fill(NO_VALUE);
         }
 
-        if defined.iter().any(|&v| v != NO_VALUE) {
+        if self.loop_first && defined.iter().any(|&v| v != NO_VALUE) {
+            // The loop isn't in the events, and adding values is quick: start over
+            self.emit(EVENT_RESET, 0, 0);
+        } else if defined.iter().any(|&v| v != NO_VALUE) {
             match self.solutions(board, &defined) {
                 Some(solutions) if !solutions.is_empty() => {
                     self.face_values = defined;
@@ -237,6 +255,11 @@ impl Generator {
         }
         self.face_values.fill(NO_VALUE);
         self.witnesses = None;
+        if self.loop_first {
+            self.solution = self.random_loop(board);
+            self.phase = Phase::Guided { attempts };
+            return;
+        }
         let mut order: Vec<u32> = (0..board.num_faces as u32).collect();
         self.shuffle(&mut order);
         self.phase = Phase::Additive {
@@ -244,6 +267,137 @@ impl Generator {
             position: 0,
             attempts,
         };
+    }
+
+    // A random loop filling the board (as in Loopy): grows a region of faces from a random face, adding random
+    // neighboring faces while its boundary stays a single loop, until none can be added. Some neighboring faces are
+    // instead kept outside for good (so the outside also reaches across the board, and the loop winds through it).
+    // Retries while the region is small. Returns the loop's sorted edges.
+    fn random_loop(&mut self, board: &Board) -> Vec<u32> {
+        loop {
+            let (edges, inside) = self.random_region_loop(board);
+            if inside * LOOP_MIN_INSIDE_DIVISOR >= board.num_faces {
+                return edges;
+            }
+        }
+    }
+
+    fn random_region_loop(&mut self, board: &Board) -> (Vec<u32>, usize) {
+        let mut inside = vec![false; board.num_faces];
+        let mut outside = vec![false; board.num_faces];
+        let mut degree = vec![0u8; board.num_vertices];
+        let mut in_frontier = vec![false; board.num_faces];
+        let mut frontier: Vec<u32> = Vec::new();
+        let mut loop_edges = 0usize;
+        let is_loop = |inside: &[bool], e: usize| {
+            board.edge_faces[e]
+                .iter()
+                .filter(|&&f| f != u32::MAX && inside[f as usize])
+                .count()
+                == 1
+        };
+        let start = (self.random() % board.num_faces as u64) as u32;
+        let mut candidate = Some(start);
+        loop {
+            if let Some(f) = candidate {
+                let f = f as usize;
+                // Tentatively add the face, updating the loop's vertex degrees
+                let edges = board.face_edges_of(f);
+                let before = loop_edges;
+                inside[f] = true;
+                let mut valid = true;
+                for &e in edges {
+                    let now = is_loop(&inside, e as usize);
+                    for &v in &board.edge_vertices[e as usize] {
+                        if now {
+                            degree[v as usize] += 1;
+                        } else {
+                            degree[v as usize] -= 1;
+                        }
+                    }
+                    if now {
+                        loop_edges += 1;
+                    } else {
+                        loop_edges -= 1;
+                    }
+                }
+                for &e in edges {
+                    for &v in &board.edge_vertices[e as usize] {
+                        if degree[v as usize] != 0 && degree[v as usize] != 2 {
+                            valid = false;
+                        }
+                    }
+                }
+                // A single loop: following it from one of the face's loop edges visits them all
+                if valid {
+                    match edges.iter().copied().find(|&e| is_loop(&inside, e as usize)) {
+                        None => valid = false,
+                        Some(first) => {
+                            let mut count = 1;
+                            let (mut previous, mut vertex) = (first, board.edge_vertices[first as usize][1]);
+                            loop {
+                                let next = board
+                                    .vertex_edges_of(vertex as usize)
+                                    .iter()
+                                    .copied()
+                                    .find(|&e| e != previous && is_loop(&inside, e as usize))
+                                    .unwrap();
+                                if next == first {
+                                    break;
+                                }
+                                count += 1;
+                                vertex = board.other_vertex(next, vertex);
+                                previous = next;
+                            }
+                            valid = count == loop_edges;
+                        }
+                    }
+                }
+                if valid {
+                    for &e in edges {
+                        for &g in &board.edge_faces[e as usize] {
+                            if g != u32::MAX && !inside[g as usize] && !outside[g as usize] && !in_frontier[g as usize]
+                            {
+                                in_frontier[g as usize] = true;
+                                frontier.push(g);
+                            }
+                        }
+                    }
+                } else {
+                    // Undo
+                    inside[f] = false;
+                    for &e in edges {
+                        let was = is_loop(&inside, e as usize);
+                        for &v in &board.edge_vertices[e as usize] {
+                            if was {
+                                degree[v as usize] += 1;
+                            } else {
+                                degree[v as usize] -= 1;
+                            }
+                        }
+                    }
+                    loop_edges = before;
+                }
+            }
+            if frontier.is_empty() {
+                break;
+            }
+            let index = (self.random() % frontier.len() as u64) as usize;
+            let f = frontier.swap_remove(index);
+            in_frontier[f as usize] = false;
+            if self.random().is_multiple_of(LOOP_OUTSIDE_ODDS) {
+                outside[f as usize] = true;
+                candidate = None;
+            } else {
+                candidate = (!inside[f as usize]).then_some(f);
+            }
+        }
+        (
+            (0..board.num_edges as u32)
+                .filter(|&e| is_loop(&inside, e as usize))
+                .collect(),
+            inside.iter().filter(|&&i| i).count(),
+        )
     }
 
     /// Does a bounded amount of work (about one face's worth)
@@ -503,7 +657,9 @@ impl Generator {
 
     // Unique: fill the faces (with a difficulty check), check the result can be minimized, and start minimizing
     fn finish_additive(&mut self, board: &Board, topology: Option<&Topology>, rules: Rules) -> Status {
-        if self.check != Check::None {
+        // (Loop-first values already solve it: minimizing starts from them rather than every face's value, which would
+        // take about twice as many checks)
+        if self.check != Check::None && !self.loop_first {
             let counts = self.solution_face_counts(board);
             for (f, &count) in counts.iter().enumerate() {
                 if self.face_values[f] == NO_VALUE {
@@ -522,16 +678,68 @@ impl Generator {
         }
         let mut order: Vec<u32> = (0..board.num_faces as u32).collect();
         self.shuffle(&mut order);
-        self.start_minimize(order);
+        self.start_minimize(board, order);
         Status::Running
     }
 
-    fn start_minimize(&mut self, order: Vec<u32>) {
+    fn start_minimize(&mut self, board: &Board, mut order: Vec<u32>) {
         self.minimize_start_values = self.face_values.clone();
         self.kept.fill(false);
         self.uniqueness = None;
         self.block = 1;
+        self.checkpoint = None;
+        self.cluster_ends.clear();
+        if self.loop_first {
+            order = self.cluster_order(board, &order);
+        } else {
+            self.cluster_ends.push(order.len());
+        }
         self.phase = Phase::Minimize { order, position: 0 };
+    }
+
+    // The faces grouped into clusters of nearby faces (breadth-first from each one in the order not yet in a cluster),
+    // each shuffled, setting cluster_ends
+    fn cluster_order(&mut self, board: &Board, order: &[u32]) -> Vec<u32> {
+        let mut wanted = vec![false; board.num_faces];
+        for &f in order {
+            wanted[f as usize] = true;
+        }
+        let mut seen = vec![false; board.num_faces];
+        let mut result = Vec::with_capacity(order.len());
+        for &start in order {
+            if !wanted[start as usize] {
+                continue;
+            }
+            let cluster_start = result.len();
+            let mut queue = std::collections::VecDeque::from([start]);
+            let mut visited = vec![start];
+            seen[start as usize] = true;
+            while let Some(f) = queue.pop_front() {
+                if wanted[f as usize] {
+                    wanted[f as usize] = false;
+                    result.push(f);
+                    if result.len() - cluster_start >= MINIMIZE_CLUSTER_SIZE {
+                        break;
+                    }
+                }
+                for &e in board.face_edges_of(f as usize) {
+                    for &g in &board.edge_faces[e as usize] {
+                        if g != u32::MAX && !seen[g as usize] {
+                            seen[g as usize] = true;
+                            visited.push(g);
+                            queue.push_back(g);
+                        }
+                    }
+                }
+            }
+            for f in visited {
+                seen[f as usize] = false;
+            }
+            let end = result.len();
+            self.shuffle(&mut result[cluster_start..end]);
+            self.cluster_ends.push(end);
+        }
+        result
     }
 
     // Removes values in blocks: a block whose values can all be removed (still unique, and solvable at the difficulty) is
@@ -561,7 +769,26 @@ impl Generator {
             return Status::Running;
         }
 
-        let block: Vec<usize> = order[position..(position + self.block).min(order.len())]
+        let cluster = self.cluster_ends.partition_point(|&end| end <= position);
+        let cluster_end = self.cluster_ends[cluster];
+        if self.loop_first
+            && let Some(sound) = rules.sound
+            && self.checkpoint.as_ref().is_none_or(|(c, _)| *c != cluster)
+        {
+            let cluster_start = if cluster == 0 {
+                0
+            } else {
+                self.cluster_ends[cluster - 1]
+            };
+            let mut faces = vec![false; board.num_faces];
+            for &f in &order[cluster_start..cluster_end] {
+                faces[f as usize] = true;
+            }
+            let _timer = profile::Timer::new(5);
+            self.checkpoint = cansolve::checkpoint(board, sound, &self.face_values, &faces, true).map(|c| (cluster, c));
+        }
+        let block_end = (position + self.block).min(cluster_end);
+        let block: Vec<usize> = order[position..block_end]
             .iter()
             .map(|&f| f as usize)
             .filter(|&f| self.face_values[f] != NO_VALUE)
@@ -574,7 +801,7 @@ impl Generator {
         let removable = self.removable(board, topology, rules, &values);
 
         if removable {
-            let end = (position + self.block).min(order.len());
+            let end = block_end;
             for &f in &order[position..end] {
                 self.emit(EVENT_MINIMIZE, f, NO_VALUE);
             }
@@ -610,7 +837,11 @@ impl Generator {
         if let Some(sound) = rules.sound {
             let solved = {
                 let _timer = profile::Timer::new(5);
-                matches!(cansolve::deduce(board, sound, values, true), Ok(d) if d.solved)
+                let deduction = match &self.checkpoint {
+                    Some((_, checkpoint)) => cansolve::deduce_from(checkpoint, board, sound, values),
+                    None => cansolve::deduce(board, sound, values, true),
+                };
+                matches!(deduction, Ok(d) if d.solved)
             };
             if solved {
                 return rules.sound_implies_difficulty || self.can_solve(board, topology, rules, values);
