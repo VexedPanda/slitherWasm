@@ -271,7 +271,8 @@ fn with_generator_context<T>(
     board_handle: u32,
     topology_handle: u32,
     rules_handle: u32,
-    callback: impl FnOnce(&solver::Board, Option<&topology::Topology>, Option<&cansolve::RuleSet>) -> T,
+    easier_rules_handle: u32,
+    callback: impl FnOnce(&solver::Board, Option<&topology::Topology>, generator::Rules) -> T,
 ) -> T {
     BOARDS.with(|boards| {
         let boards = boards.borrow();
@@ -281,7 +282,10 @@ fn with_generator_context<T>(
             let topology = topologies.get(topology_handle as usize).and_then(|t| t.as_ref());
             RULE_SETS.with(|sets| {
                 let sets = sets.borrow();
-                let rules = sets.get(rules_handle as usize).and_then(|r| r.as_ref());
+                let rules = generator::Rules {
+                    main: sets.get(rules_handle as usize).and_then(|r| r.as_ref()),
+                    easier: sets.get(easier_rules_handle as usize).and_then(|r| r.as_ref()),
+                };
                 callback(board, topology, rules)
             })
         })
@@ -290,6 +294,7 @@ fn with_generator_context<T>(
 
 /// Starts generating a puzzle (see generator.rs), returning its handle. `check` is 0 for no difficulty check, 1 for the
 /// EASY/MEDIUM rules and 2 for HARD's (with the rules handle, and for HARD the topology handle; 0xffffffff for none).
+/// The easier rules (EASY/MEDIUM-style, optional) are tried first (see generator.rs).
 /// `resume` holds earlier progress events (type, face, value) to continue from.
 ///
 /// # Safety
@@ -300,6 +305,7 @@ pub unsafe extern "C" fn gen_create(
     board_handle: u32,
     topology_handle: u32,
     rules_handle: u32,
+    easier_rules_handle: u32,
     check: u32,
     seed_low: u32,
     seed_high: u32,
@@ -317,9 +323,13 @@ pub unsafe extern "C" fn gen_create(
         _ => generator::Check::None,
     };
     let seed = ((seed_high as u64) << 32) | seed_low as u64;
-    let generator = with_generator_context(board_handle, topology_handle, rules_handle, |board, topology, rules| {
-        generator::Generator::new(board, topology, rules, check, seed, resume)
-    });
+    let generator = with_generator_context(
+        board_handle,
+        topology_handle,
+        rules_handle,
+        easier_rules_handle,
+        |board, topology, rules| generator::Generator::new(board, topology, rules, check, seed, resume),
+    );
     GENERATORS.with(|generators| {
         let mut generators = generators.borrow_mut();
         if let Some(index) = generators.iter().position(|g| g.is_none()) {
@@ -335,19 +345,32 @@ pub unsafe extern "C" fn gen_create(
 /// Runs up to `steps` steps (about a face each). Returns 0 while running, 1 when done, 2 if generation failed. The
 /// progress events so far are then in the output buffer (type, face, value triples).
 #[unsafe(no_mangle)]
-pub extern "C" fn gen_step(handle: u32, board_handle: u32, topology_handle: u32, rules_handle: u32, steps: u32) -> u32 {
+pub extern "C" fn gen_step(
+    handle: u32,
+    board_handle: u32,
+    topology_handle: u32,
+    rules_handle: u32,
+    easier_rules_handle: u32,
+    steps: u32,
+) -> u32 {
     GENERATORS.with(|generators| {
         let mut generators = generators.borrow_mut();
         let generator = generators[handle as usize].as_mut().expect("disposed generator");
         let mut status = generator::Status::Running;
-        with_generator_context(board_handle, topology_handle, rules_handle, |board, topology, rules| {
-            for _ in 0..steps.max(1) {
-                status = generator.step(board, topology, rules);
-                if !matches!(status, generator::Status::Running) {
-                    break;
+        with_generator_context(
+            board_handle,
+            topology_handle,
+            rules_handle,
+            easier_rules_handle,
+            |board, topology, rules| {
+                for _ in 0..steps.max(1) {
+                    status = generator.step(board, topology, rules);
+                    if !matches!(status, generator::Status::Running) {
+                        break;
+                    }
                 }
-            }
-        });
+            },
+        );
         OUTPUT.with(|output| {
             let mut output = output.borrow_mut();
             output.clear();

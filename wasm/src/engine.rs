@@ -1570,7 +1570,8 @@ impl<'a> Engine<'a> {
     // pairs by random ids.)
     fn face_color_disconnection(&mut self) -> Result<()> {
         let t = self.t;
-        let mut tested: Vec<(u32, u32, u8)> = Vec::new();
+        profile::count(6);
+        let mut tested: std::collections::HashSet<(u32, u32, u8)> = std::collections::HashSet::new();
         let mut opposites: Vec<(Color, Color)> = Vec::new();
         for v in 0..t.num_vertices {
             let mut colors: Vec<Color> = Vec::new();
@@ -1587,10 +1588,10 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let key = (a.0.min(b.0), a.0.max(b.0), a.1 ^ b.1);
-                    if tested.contains(&key) {
+                    if !tested.insert(key) {
                         continue;
                     }
-                    tested.push(key);
+                    profile::count(7);
                     let mut scratch = self.scratch.take().unwrap();
                     let disconnected = self.disconnected_when_same(a, b, &mut scratch);
                     self.scratch = Some(scratch);

@@ -33,8 +33,17 @@ pub enum Check {
 
 // Most recent loops are checked first, and the oldest are dropped past this (as in KnownSolutions.ts)
 const MAX_KNOWN_SOLUTIONS: usize = 200;
+// The most values minimization tries to remove at once
+const MAX_MINIMIZE_BLOCK: usize = 32;
 // Give up on an additive pass after this many (as in generateFaceAdditive.ts)
 const MAX_ADDITIVE_ATTEMPTS: u32 = 100;
+
+/// The difficulty's rules, and optionally an easier difficulty's (a subset of them, see can_solve)
+#[derive(Clone, Copy)]
+pub struct Rules<'a> {
+    pub main: Option<&'a RuleSet>,
+    pub easier: Option<&'a RuleSet>,
+}
 
 pub enum Status {
     Running,
@@ -73,6 +82,10 @@ pub struct Generator {
     uniqueness: Option<Uniqueness>,
     // Solution counting while adding values
     counter: Option<SolutionCounter>,
+    // Values to try removing at once while minimizing
+    block: usize,
+    // Two solutions of the current values, while adding values
+    witnesses: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 impl Generator {
@@ -80,7 +93,7 @@ impl Generator {
     pub fn new(
         board: &Board,
         topology: Option<&Topology>,
-        rules: Option<&RuleSet>,
+        rules: Rules,
         check: Check,
         seed: u64,
         resume: &[u32],
@@ -97,6 +110,8 @@ impl Generator {
             kept: vec![false; board.num_faces],
             uniqueness: None,
             counter: None,
+            block: 1,
+            witnesses: None,
         };
         generator.resume(board, topology, rules, resume);
         generator
@@ -123,7 +138,7 @@ impl Generator {
 
     // Continues from earlier progress: minimizing (if it got that far, and the puzzle still checks out), otherwise
     // adding values to the faces defined so far
-    fn resume(&mut self, board: &Board, topology: Option<&Topology>, rules: Option<&RuleSet>, events: &[u32]) {
+    fn resume(&mut self, board: &Board, topology: Option<&Topology>, rules: Rules, events: &[u32]) {
         let mut defined = vec![NO_VALUE; board.num_faces];
         let mut minimized = vec![None; board.num_faces];
         for event in events.chunks(3) {
@@ -194,6 +209,7 @@ impl Generator {
             return;
         }
         self.face_values.fill(NO_VALUE);
+        self.witnesses = None;
         let mut order: Vec<u32> = (0..board.num_faces as u32).collect();
         self.shuffle(&mut order);
         self.phase = Phase::Additive {
@@ -204,7 +220,7 @@ impl Generator {
     }
 
     /// Does a bounded amount of work (about one face's worth)
-    pub fn step(&mut self, board: &Board, topology: Option<&Topology>, rules: Option<&RuleSet>) -> Status {
+    pub fn step(&mut self, board: &Board, topology: Option<&Topology>, rules: Rules) -> Status {
         match std::mem::replace(&mut self.phase, Phase::Failed) {
             Phase::Additive {
                 order,
@@ -220,15 +236,32 @@ impl Generator {
         }
     }
 
+    // Adds one value. With two known solutions, it's the value one of them has on a face where they differ, which rules
+    // out the other (and keeps a solution); otherwise a random value on the next face in the random order.
     fn additive_step(
         &mut self,
         board: &Board,
         topology: Option<&Topology>,
-        rules: Option<&RuleSet>,
+        rules: Rules,
         order: Vec<u32>,
         position: usize,
         attempts: u32,
     ) -> Status {
+        if let Some((face, value)) = self.witness_value(board) {
+            self.face_values[face] = value;
+            match self.solution_count(board) {
+                Some(solutions) if !solutions.is_empty() => {
+                    self.emit(EVENT_DEFINE, face as u32, value);
+                    return self.after_count(board, topology, rules, solutions, order, position, attempts);
+                }
+                _ => {
+                    // (the SAT solver gave up)
+                    self.face_values[face] = NO_VALUE;
+                    self.witnesses = None;
+                }
+            }
+        }
+
         if position >= order.len() {
             // A whole pass without a unique solution: start over (generateFaceAdditive's retry)
             self.start_additive(board, attempts + 1);
@@ -239,6 +272,14 @@ impl Generator {
             };
         }
         let face = order[position] as usize;
+        if self.face_values[face] != NO_VALUE {
+            self.phase = Phase::Additive {
+                order,
+                position: position + 1,
+                attempts,
+            };
+            return Status::Running;
+        }
         let n = board.face_edge_count(face) as u32;
         // A random value, not all of the face's edges (the shuffle is redone once if it starts with 0, which makes 0s
         // less likely)
@@ -249,27 +290,11 @@ impl Generator {
         }
         for value in values {
             self.face_values[face] = value as u8;
-            let count = match self.solution_count(board) {
-                Some((count, solution)) => {
-                    if count == 1 {
-                        self.solution = solution;
-                    }
-                    count
-                }
-                // Too many SAT iterations: treated as no solution
-                None => 0,
-            };
-            if count >= 1 {
+            // (None: too many SAT iterations, treated as no solution)
+            let solutions = self.solution_count(board).unwrap_or_default();
+            if !solutions.is_empty() {
                 self.emit(EVENT_DEFINE, face as u32, value as u8);
-                if count == 1 {
-                    return self.finish_additive(board, topology, rules);
-                }
-                self.phase = Phase::Additive {
-                    order,
-                    position: position + 1,
-                    attempts,
-                };
-                return Status::Running;
+                return self.after_count(board, topology, rules, solutions, order, position + 1, attempts);
             }
         }
         self.face_values[face] = NO_VALUE;
@@ -281,8 +306,80 @@ impl Generator {
         Status::Running
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn after_count(
+        &mut self,
+        board: &Board,
+        topology: Option<&Topology>,
+        rules: Rules,
+        mut solutions: Vec<Vec<u32>>,
+        order: Vec<u32>,
+        position: usize,
+        attempts: u32,
+    ) -> Status {
+        if solutions.len() == 1 {
+            self.solution = solutions.pop().unwrap();
+            self.witnesses = None;
+            return self.finish_additive(board, topology, rules);
+        }
+        let b = solutions.pop().unwrap();
+        let a = solutions.pop().unwrap();
+        self.witnesses = Some((a, b));
+        self.phase = Phase::Additive {
+            order,
+            position,
+            attempts,
+        };
+        Status::Running
+    }
+
+    // A face (without a value) where the two witness solutions have different counts, and one of their counts (not all
+    // of the face's edges), chosen randomly
+    fn witness_value(&mut self, board: &Board) -> Option<(usize, u8)> {
+        let (a, b) = self.witnesses.take()?;
+        let counts_a = Self::face_counts(board, &a);
+        let counts_b = Self::face_counts(board, &b);
+        let keep_a = self.random() & 1 == 0;
+        let mut candidates: Vec<(usize, u8)> = Vec::new();
+        for keep_first in [keep_a, !keep_a] {
+            let (kept, other) = if keep_first {
+                (&counts_a, &counts_b)
+            } else {
+                (&counts_b, &counts_a)
+            };
+            candidates = (0..board.num_faces)
+                .filter(|&f| {
+                    self.face_values[f] == NO_VALUE
+                        && kept[f] != other[f]
+                        && (kept[f] as usize) < board.face_edge_count(f)
+                })
+                .map(|f| (f, kept[f]))
+                .collect();
+            if !candidates.is_empty() {
+                break;
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let index = (self.random() % candidates.len() as u64) as usize;
+        Some(candidates[index])
+    }
+
+    fn face_counts(board: &Board, edges: &[u32]) -> Vec<u8> {
+        let mut counts = vec![0u8; board.num_faces];
+        for &e in edges {
+            for &f in &board.edge_faces[e as usize] {
+                if f != u32::MAX {
+                    counts[f as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
+
     // Unique: fill the faces (with a difficulty check), check the result can be minimized, and start minimizing
-    fn finish_additive(&mut self, board: &Board, topology: Option<&Topology>, rules: Option<&RuleSet>) -> Status {
+    fn finish_additive(&mut self, board: &Board, topology: Option<&Topology>, rules: Rules) -> Status {
         if self.check != Check::None {
             let counts = self.solution_face_counts(board);
             for (f, &count) in counts.iter().enumerate() {
@@ -310,14 +407,19 @@ impl Generator {
         self.minimize_start_values = self.face_values.clone();
         self.kept.fill(false);
         self.uniqueness = None;
+        self.block = 1;
         self.phase = Phase::Minimize { order, position: 0 };
     }
 
+    // Removes values in blocks: a block whose values can all be removed (still unique, and solvable at the difficulty) is
+    // removed together and the next block is twice as big; otherwise the block is halved and retried, down to single
+    // values, which are kept if they can't be removed. This needs far fewer checks than one value at a time while most
+    // values can be removed.
     fn minimize_step(
         &mut self,
         board: &Board,
         topology: Option<&Topology>,
-        rules: Option<&RuleSet>,
+        rules: Rules,
         order: Vec<u32>,
         position: usize,
     ) -> Status {
@@ -325,42 +427,77 @@ impl Generator {
             self.phase = Phase::Done;
             return Status::Done;
         }
+        // Skip faces without values
         let face = order[position] as usize;
-        let value = self.face_values[face];
-        if value == NO_VALUE {
+        if self.face_values[face] == NO_VALUE {
             self.emit(EVENT_MINIMIZE, face as u32, NO_VALUE);
-        } else {
-            self.face_values[face] = NO_VALUE;
-            // Cheapest first: known loops showing multiple solutions, the difficulty check, then whether SAT finds a
-            // solution other than the known one
-            let values = self.face_values.clone();
-            let removable = !self.known_multiple(&values)
-                && self.is_unique(board, &values)
-                && self.can_solve(board, topology, rules, &values);
-            if !removable {
-                self.kept[face] = true;
-            }
-            if removable {
-                self.emit(EVENT_MINIMIZE, face as u32, NO_VALUE);
-            } else {
-                self.face_values[face] = value;
-                self.emit(EVENT_MINIMIZE, face as u32, value);
-            }
+            self.phase = Phase::Minimize {
+                order,
+                position: position + 1,
+            };
+            return Status::Running;
         }
-        self.phase = Phase::Minimize {
-            order,
-            position: position + 1,
-        };
+
+        let block: Vec<usize> = order[position..(position + self.block).min(order.len())]
+            .iter()
+            .map(|&f| f as usize)
+            .filter(|&f| self.face_values[f] != NO_VALUE)
+            .collect();
+        let saved: Vec<u8> = block.iter().map(|&f| self.face_values[f]).collect();
+        for &f in &block {
+            self.face_values[f] = NO_VALUE;
+        }
+        // Cheapest first: known loops showing multiple solutions, SAT uniqueness, then the difficulty check
+        let values = self.face_values.clone();
+        let removable = !self.known_multiple(&values)
+            && self.is_unique(board, &values)
+            && self.can_solve(board, topology, rules, &values);
+
+        if removable {
+            let end = (position + self.block).min(order.len());
+            for &f in &order[position..end] {
+                self.emit(EVENT_MINIMIZE, f, NO_VALUE);
+            }
+            self.block = (self.block * 2).min(MAX_MINIMIZE_BLOCK);
+            self.phase = Phase::Minimize { order, position: end };
+            return Status::Running;
+        }
+
+        for (&f, &value) in block.iter().zip(&saved) {
+            self.face_values[f] = value;
+        }
+        if self.block > 1 {
+            self.block /= 2;
+            self.phase = Phase::Minimize { order, position };
+        } else {
+            self.kept[face] = true;
+            self.emit(EVENT_MINIMIZE, face as u32, saved[0]);
+            self.phase = Phase::Minimize {
+                order,
+                position: position + 1,
+            };
+        }
         Status::Running
     }
 
-    fn can_solve(&self, board: &Board, topology: Option<&Topology>, rules: Option<&RuleSet>, values: &[u8]) -> bool {
+    fn can_solve(&self, board: &Board, topology: Option<&Topology>, rules: Rules, values: &[u8]) -> bool {
         let _timer = profile::Timer::new(1);
+        if self.check == Check::None {
+            return true;
+        }
+        // An easier difficulty's rules are a subset of this one's, so if they solve it, so would these (and they're
+        // much cheaper)
+        if let Some(easier) = rules.easier
+            && matches!(cansolve::can_solve(board, easier, values), Ok(true))
+        {
+            profile::count(3, 0);
+            return true;
+        }
         match self.check {
             Check::None => true,
-            Check::Simple => matches!(cansolve::can_solve(board, rules.unwrap(), values), Ok(true)),
+            Check::Simple => matches!(cansolve::can_solve(board, rules.main.unwrap(), values), Ok(true)),
             Check::Hard => matches!(
-                engine::can_solve_hard(topology.unwrap(), rules.unwrap(), values),
+                engine::can_solve_hard(topology.unwrap(), rules.main.unwrap(), values),
                 Ok(true)
             ),
         }
@@ -368,15 +505,14 @@ impl Generator {
 
     // The number of solutions of the current values (0, 1, or 2 for more), and the solution if unique. None if the
     // SAT solver gave up.
-    fn solution_count(&mut self, board: &Board) -> Option<(usize, Vec<u32>)> {
-        if self.known_multiple(&self.face_values) {
-            return Some((2, Vec::new()));
+    // The solutions of the current values: none, one (unique), or two (witnesses of multiple solutions), or None if the
+    // SAT solver gave up
+    fn solution_count(&mut self, board: &Board) -> Option<Vec<Vec<u32>>> {
+        if let Some((a, b)) = self.known_pair(&self.face_values) {
+            return Some(vec![self.known[a].1.clone(), self.known[b].1.clone()]);
         }
         let values = self.face_values.clone();
-        let solutions = self.solutions(board, &values)?;
-        let count = solutions.len();
-        let solution = if count == 1 { solutions[0].clone() } else { Vec::new() };
-        Some((count, solution))
+        self.solutions(board, &values)
     }
 
     // Whether the known solution is the only one (false if the SAT solver gave up), with the minimization's incremental
@@ -430,12 +566,17 @@ impl Generator {
 
     // Whether two known loops are solutions for these values (so there are multiple solutions)
     fn known_multiple(&self, values: &[u8]) -> bool {
+        self.known_pair(values).is_some()
+    }
+
+    // Two known loops that are solutions for these values (indices into known), if any
+    fn known_pair(&self, values: &[u8]) -> Option<(usize, usize)> {
         let _timer = profile::Timer::new(2);
         if values.iter().all(|&v| v == NO_VALUE) {
-            return false;
+            return None;
         }
-        let mut count = 0;
-        for (counts, _) in self.known.iter().rev() {
+        let mut first = None;
+        for (index, (counts, _)) in self.known.iter().enumerate().rev() {
             let mut valid = true;
             let mut touches = false;
             for (f, &value) in values.iter().enumerate() {
@@ -448,13 +589,13 @@ impl Generator {
                 }
             }
             if valid && touches {
-                count += 1;
-                if count >= 2 {
-                    return true;
+                match first {
+                    None => first = Some(index),
+                    Some(a) => return Some((a, index)),
                 }
             }
         }
-        false
+        None
     }
 
     fn solution_face_counts(&self, board: &Board) -> Vec<u8> {

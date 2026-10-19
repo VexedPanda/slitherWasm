@@ -31,11 +31,24 @@ type CanSolve = (board: TBoard, state: TState<TCompleteData>) => boolean;
 // larger rule set), with the same rules as their TS solvers
 type WasmCheck = { canSolve: CanSolve; getRules: (board: TBoard) => WasmDifficultyRules };
 
-const wasmCheck = (difficulty: string, groups: RuleGroupLimit[], hard = false): WasmCheck => {
+// The rule groups of EASY and MEDIUM (each difficulty's rules include the easier ones', see generator.rs)
+const EASY_GROUPS: RuleGroupLimit[] = [{ group: generalEdgeMixedGroup, size: 120 }];
+const MEDIUM_GROUPS: RuleGroupLimit[] = [
+  { group: generalEdgeSectorMixedGroup, size: 50 },
+  { group: generalEdgeMixedGroup, size: 360 },
+];
+
+const wasmCheck = (
+  difficulty: string,
+  groups: RuleGroupLimit[],
+  hard = false,
+  easier?: { key: string; groups: RuleGroupLimit[] },
+): WasmCheck => {
   const getRules = (board: TBoard): WasmDifficultyRules => ({
     key: difficulty,
     getRules: () => compilePatternRules(board, groups),
     hard: hard,
+    easier: easier && { key: easier.key, getRules: () => compilePatternRules(board, easier.groups) },
   });
   return {
     canSolve: (board, state) => {
@@ -105,7 +118,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCheck('EASY', [{ group: generalEdgeMixedGroup, size: 120 }]),
+    wasmCheck('EASY', EASY_GROUPS),
   );
 
   public static readonly MEDIUM = new CanSolveDifficulty(
@@ -148,10 +161,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCheck('MEDIUM', [
-      { group: generalEdgeSectorMixedGroup, size: 50 },
-      { group: generalEdgeMixedGroup, size: 360 },
-    ]),
+    wasmCheck('MEDIUM', MEDIUM_GROUPS, false, { key: 'EASY', groups: EASY_GROUPS }),
   );
 
   public static readonly HARD = new CanSolveDifficulty(
@@ -207,6 +217,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
         { group: generalEdgeMixedGroup, size: 1000 },
       ],
       true,
+      { key: 'MEDIUM', groups: MEDIUM_GROUPS },
     ),
   );
 

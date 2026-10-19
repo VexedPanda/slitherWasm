@@ -1,7 +1,7 @@
 //! Native profiling of puzzle generation on a dumped board (see profile_hard.rs for the dump format):
 //! cargo run --release --features profile --example profile_generate <dump> <check: 0 none, 1 simple, 2 hard> [count]
 use slither_core::cansolve::RuleSet;
-use slither_core::generator::{Check, Generator, Status};
+use slither_core::generator::{Check, Generator, Rules, Status};
 use slither_core::solver::Board;
 use slither_core::topology::Topology;
 
@@ -51,13 +51,31 @@ fn main() {
     let face_edges: Vec<u32> = fhe.iter().map(|&h| he[6 * h as usize + 2]).collect();
     let board = Board::new(nv, &edge_vertices, &fo, &face_edges);
     let rules = RuleSet::new(ne, num_sectors, &clauses, clause_count);
+    // Optional easier (MEDIUM) rules, dumped after the face value sets
+    let _faces = next();
+    let easier_header = next();
+    let easier_clauses = next();
+    let easier = if easier_header.is_empty() {
+        None
+    } else {
+        Some(RuleSet::new(
+            ne,
+            easier_header[0] as usize,
+            &easier_clauses,
+            easier_header[1] as usize,
+        ))
+    };
+    let rule_sets = Rules {
+        main: Some(&rules),
+        easier: easier.as_ref(),
+    };
 
     let start = std::time::Instant::now();
     for seed in 1..=count {
-        let mut generator = Generator::new(&board, Some(&topology), Some(&rules), check, seed * 7919, &[]);
+        let mut generator = Generator::new(&board, Some(&topology), rule_sets, check, seed * 7919, &[]);
         loop {
             generator.events.clear();
-            match generator.step(&board, Some(&topology), Some(&rules)) {
+            match generator.step(&board, Some(&topology), rule_sets) {
                 Status::Running => {}
                 Status::Done => break,
                 Status::Failed => panic!("failed"),
@@ -75,5 +93,12 @@ fn main() {
             "  counts per puzzle: {:?}",
             unsafe { slither_core::generator::profile::COUNTS }.map(|c| c / count)
         );
+        let engine = unsafe { slither_core::engine::profile::TOTALS };
+        for (name, total) in slither_core::engine::profile::NAMES.iter().zip(engine) {
+            if total > 0.0 {
+                println!("    HARD engine {:35} {:.2} s per puzzle", name, total / count as f64);
+            }
+        }
+        println!("    HARD engine counts per puzzle: {:?}", unsafe { slither_core::engine::profile::COUNTS }.map(|c| c / count));
     }
 }

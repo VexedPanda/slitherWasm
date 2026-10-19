@@ -63,13 +63,21 @@ type CoreExports = {
     boardHandle: number,
     topologyHandle: number,
     rulesHandle: number,
+    easierRulesHandle: number,
     check: number,
     seedLow: number,
     seedHigh: number,
     resume: number,
     resumeLength: number,
   ) => number;
-  gen_step: (handle: number, boardHandle: number, topologyHandle: number, rulesHandle: number, steps: number) => number;
+  gen_step: (
+    handle: number,
+    boardHandle: number,
+    topologyHandle: number,
+    rulesHandle: number,
+    easierRulesHandle: number,
+    steps: number,
+  ) => number;
   gen_result: (handle: number) => void;
   gen_dispose: (handle: number) => void;
 };
@@ -370,6 +378,8 @@ export type WasmDifficultyRules = {
   key: string;
   getRules: () => CompiledRules;
   hard: boolean;
+  // An easier difficulty's EASY/MEDIUM-style rules (a subset of these), tried first since they're cheaper
+  easier?: { key: string; getRules: () => CompiledRules };
 };
 
 export type WasmGenerationEvent =
@@ -393,6 +403,7 @@ export const wasmGenerate = async (
   const core = getCore();
   const boardHandle = getCoreBoard(board).handle;
   const rulesHandle = rules ? getRulesHandle(board, rules.key, rules.getRules) : NONE;
+  const easierRulesHandle = rules?.easier ? getRulesHandle(board, rules.easier.key, rules.easier.getRules) : NONE;
   const topologyHandle = rules?.hard ? getTopologyHandle(board) : NONE;
   const check =
     !rules ? 0
@@ -408,13 +419,23 @@ export const wasmGenerate = async (
     }
   }
   const handle = withU32Array(resumeData, (pointer) =>
-    core.gen_create(boardHandle, topologyHandle, rulesHandle, check, seed[0], seed[1], pointer, resumeData.length),
+    core.gen_create(
+      boardHandle,
+      topologyHandle,
+      rulesHandle,
+      easierRulesHandle,
+      check,
+      seed[0],
+      seed[1],
+      pointer,
+      resumeData.length,
+    ),
   );
 
   try {
     let lastYield = performance.now();
     while (true) {
-      const status = core.gen_step(handle, boardHandle, topologyHandle, rulesHandle, 1);
+      const status = core.gen_step(handle, boardHandle, topologyHandle, rulesHandle, easierRulesHandle, 1);
       const output = new Uint32Array(core.memory.buffer, core.output_pointer(), core.output_length()).slice();
       for (let i = 0; i < output.length; i += 3) {
         const type = output[i];
