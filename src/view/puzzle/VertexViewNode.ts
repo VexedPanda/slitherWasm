@@ -1,8 +1,8 @@
+import { ChunkedPaths, Chunking } from './ChunkedPaths.ts';
 import { TPuzzleStyle } from './TPuzzleStyle.ts';
 
 import { Multilink, TReadOnlyProperty } from 'scenerystack/axon';
-import { Shape } from 'scenerystack/kite';
-import { Path } from 'scenerystack/scenery';
+import { Node } from 'scenerystack/scenery';
 
 import { TBoard } from '../../model/board/core/TBoard.ts';
 import { TState } from '../../model/data/core/TState.ts';
@@ -14,16 +14,22 @@ import assert, { assertEnabled } from '../../workarounds/assert.ts';
 const smallRadius = 0.03;
 const largeRadius = 0.05;
 
-export class VertexViewNode extends Path {
+export class VertexViewNode extends Node {
   public constructor(
     board: TBoard,
     stateProperty: TReadOnlyProperty<TState<TEdgeStateData>>,
     isSolvedProperty: TReadOnlyProperty<boolean>,
     style: TPuzzleStyle,
   ) {
-    super(null, {
-      pickable: false,
+    // Drawn in chunks of nearby vertices, so a move only rebuilds the chunks it changed
+    const vertexIndices = new Map(board.vertices.map((vertex, index) => [vertex, index]));
+    const paths = new ChunkedPaths(new Chunking(board.vertices.map((vertex) => vertex.viewCoordinates)), {
       fill: style.theme.vertexColorProperty,
+    });
+
+    super({
+      pickable: false,
+      children: [paths],
     });
 
     const edgeStates: EdgeState[] = board.edges.map((edge) => EdgeState.BLACK); // Used because this can trigger sector display or not
@@ -49,22 +55,20 @@ export class VertexViewNode extends Path {
             if (edgeState !== edgeStates[i]) {
               changed = true;
               edgeStates[i] = edgeState;
+              paths.markItemDirty(vertexIndices.get(board.edges[i].start)!);
+              paths.markItemDirty(vertexIndices.get(board.edges[i].end)!);
             }
           }
 
-          if (lastVertexStyle !== vertexStyle) {
+          if (lastVertexStyle !== vertexStyle || lastIsSmall !== isSmall) {
             lastVertexStyle = vertexStyle;
-            changed = true;
-          }
-          if (lastIsSmall !== isSmall) {
             lastIsSmall = isSmall;
             changed = true;
+            paths.markAllDirty();
           }
 
           if (changed) {
-            const shape = new Shape();
-
-            for (let i = 0; i < board.vertices.length; i++) {
+            paths.update((shape, i) => {
               const vertex = board.vertices[i];
               if (vertex.edges.every((edge) => state.getEdgeState(edge) !== EdgeState.BLACK)) {
                 const point = vertex.viewCoordinates;
@@ -79,9 +83,7 @@ export class VertexViewNode extends Path {
                   assertEnabled() && assert(false, `unhandled vertex style: ${vertexStyle}`);
                 }
               }
-            }
-
-            this.shape = shape;
+            });
           }
         }
       },
