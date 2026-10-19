@@ -4,6 +4,7 @@
  * Boards are registered with the core once (cached per board) and each solve only passes face values and edge states,
  * through linear memory.
  */
+import { CompiledRules } from './compilePatternRules.ts';
 import { slitherCoreWasmBase64 } from './slitherCoreWasm.ts';
 
 import { TBoard } from '../model/board/core/TBoard.ts';
@@ -38,6 +39,14 @@ type CoreExports = {
   output_pointer: () => number;
   output_length: () => number;
   last_conflicts: () => number;
+  rules_create: (
+    boardHandle: number,
+    numSectors: number,
+    clauses: number,
+    clausesLength: number,
+    clauseCount: number,
+  ) => number;
+  can_solve: (boardHandle: number, rulesHandle: number, faceValues: number) => number;
 };
 
 let core: CoreExports | null = null;
@@ -213,4 +222,43 @@ export const wasmSolve = (
     solutions.push(solution);
   }
   return solutions;
+};
+
+const rulesHandles = new WeakMap<TBoard, Map<string, number>>();
+
+/**
+ * Whether the deduction rules solve the puzzle from its face values (see wasm/src/cansolve.rs). The rules are compiled
+ * (by getRules, e.g. with compilePatternRules) and registered once per board and key. Returns null on a contradiction.
+ */
+export const wasmCanSolve = (
+  board: TBoard,
+  state: TFaceValueData,
+  rulesKey: string,
+  getRules: () => CompiledRules,
+): boolean | null => {
+  const core = getCore();
+  const coreBoard = getCoreBoard(board);
+
+  let boardRules = rulesHandles.get(board);
+  if (!boardRules) {
+    boardRules = new Map();
+    rulesHandles.set(board, boardRules);
+  }
+  let rulesHandle = boardRules.get(rulesKey);
+  if (rulesHandle === undefined) {
+    const rules = getRules();
+    rulesHandle = withU32Array(rules.clauses, (pointer) =>
+      core.rules_create(coreBoard.handle, rules.numSectors, pointer, rules.clauses.length, rules.clauseCount),
+    );
+    boardRules.set(rulesKey, rulesHandle);
+  }
+
+  const faceValues = new Uint8Array(core.memory.buffer, coreBoard.faceValuesPointer, board.faces.length);
+  board.faces.forEach((face, index) => {
+    const value = state.getFaceValue(face);
+    faceValues[index] = value === null ? 0xff : value;
+  });
+
+  const result = core.can_solve(coreBoard.handle, rulesHandle, coreBoard.faceValuesPointer);
+  return result < 0 ? null : result === 1;
 };

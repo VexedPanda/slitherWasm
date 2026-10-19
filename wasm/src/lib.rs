@@ -1,6 +1,7 @@
 //! WebAssembly exports for the Slitherlink core. The JS side (src/wasm/slitherCore.ts) passes flat typed arrays through
 //! linear memory: it allocates with `alloc`, writes, calls, reads, and frees with `dealloc`.
 
+pub mod cansolve;
 pub mod sat;
 pub mod solver;
 
@@ -8,6 +9,7 @@ use solver::{Board, SolveResult};
 use std::cell::RefCell;
 
 thread_local! {
+    static RULE_SETS: RefCell<Vec<Option<cansolve::RuleSet>>> = const { RefCell::new(Vec::new()) };
     static BOARDS: RefCell<Vec<Option<Board>>> = const { RefCell::new(Vec::new()) };
     // Output of the last solve: [solution count, then for each solution its length and edge indices]
     static OUTPUT: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -142,4 +144,58 @@ pub extern "C" fn output_pointer() -> *const u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn output_length() -> u32 {
     OUTPUT.with(|output| output.borrow().len() as u32)
+}
+
+/// Registers compiled pattern rules (see compilePatternRules.ts) for a board, returning their handle.
+///
+/// # Safety
+/// `clauses` must reference `clauses_length` u32s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rules_create(
+    board_handle: u32,
+    num_sectors: u32,
+    clauses: *const u32,
+    clauses_length: u32,
+    clause_count: u32,
+) -> u32 {
+    let num_edges = BOARDS.with(|boards| boards.borrow()[board_handle as usize].as_ref().unwrap().num_edges);
+    let data = unsafe { std::slice::from_raw_parts(clauses, clauses_length as usize) };
+    let rules = cansolve::RuleSet::new(num_edges, num_sectors as usize, data, clause_count as usize);
+    RULE_SETS.with(|sets| {
+        let mut sets = sets.borrow_mut();
+        sets.push(Some(rules));
+        (sets.len() - 1) as u32
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rules_dispose(handle: u32) {
+    RULE_SETS.with(|sets| {
+        if let Some(slot) = sets.borrow_mut().get_mut(handle as usize) {
+            *slot = None;
+        }
+    });
+}
+
+/// Whether the rules solve the puzzle with these face values (one u8 per face, 0xff for none): 1 if so, 0 if not, -1 if
+/// the deductions hit a contradiction.
+///
+/// # Safety
+/// `face_values` must have one entry per face of the board.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn can_solve(board_handle: u32, rules_handle: u32, face_values: *const u8) -> i32 {
+    BOARDS.with(|boards| {
+        let boards = boards.borrow();
+        let board = boards[board_handle as usize].as_ref().expect("disposed board");
+        let face_values = unsafe { std::slice::from_raw_parts(face_values, board.num_faces) };
+        RULE_SETS.with(|sets| {
+            let sets = sets.borrow();
+            let rules = sets[rules_handle as usize].as_ref().expect("disposed rules");
+            match cansolve::can_solve(board, rules, face_values) {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(_) => -1,
+            }
+        })
+    })
 }

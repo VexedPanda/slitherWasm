@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit -p .",
     "build:wasm": "node bin/build-wasm.js",
-    "test:solver": "node test/node/run.mjs test/node/solverEquivalence.ts 400 15,20,20,25"
+    "test:solver": "node test/node/run.mjs test/node/solverEquivalence.ts 400 15,20,20,25 && node test/node/run.mjs test/node/canSolveEquivalence.ts"
   },
   "dependencies": {
     "@techstark/opencv-js": "5.0.0-release.1",

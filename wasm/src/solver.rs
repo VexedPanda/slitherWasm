@@ -29,6 +29,11 @@ pub struct Board {
     pub face_edges: Vec<u32>,
     // Up to two faces per edge (u32::MAX when there is none, e.g. on the boundary)
     pub edge_faces: Vec<[u32; 2]>,
+    // Vertices of each face, and faces of each vertex (CSR)
+    face_vertex_offsets: Vec<u32>,
+    face_vertices: Vec<u32>,
+    vertex_face_offsets: Vec<u32>,
+    vertex_faces: Vec<u32>,
 }
 
 impl Board {
@@ -70,6 +75,28 @@ impl Board {
             }
         }
 
+        let mut face_vertex_offsets = vec![0u32];
+        let mut face_vertices: Vec<u32> = Vec::new();
+        let mut vertex_face_lists: Vec<Vec<u32>> = vec![Vec::new(); num_vertices];
+        for f in 0..num_faces {
+            let start = face_vertices.len();
+            for i in face_edge_offsets[f]..face_edge_offsets[f + 1] {
+                for v in ev[face_edges[i as usize] as usize] {
+                    if !face_vertices[start..].contains(&v) {
+                        face_vertices.push(v);
+                        vertex_face_lists[v as usize].push(f as u32);
+                    }
+                }
+            }
+            face_vertex_offsets.push(face_vertices.len() as u32);
+        }
+        let mut vertex_face_offsets = vec![0u32];
+        let mut vertex_faces: Vec<u32> = Vec::new();
+        for list in &vertex_face_lists {
+            vertex_faces.extend_from_slice(list);
+            vertex_face_offsets.push(vertex_faces.len() as u32);
+        }
+
         Board {
             num_vertices,
             num_edges,
@@ -80,7 +107,41 @@ impl Board {
             face_edge_offsets: face_edge_offsets.to_vec(),
             face_edges: face_edges.to_vec(),
             edge_faces,
+            face_vertex_offsets,
+            face_vertices,
+            vertex_face_offsets,
+            vertex_faces,
         }
+    }
+
+    pub fn vertex_degree(&self, v: usize) -> usize {
+        (self.vertex_edge_offsets[v + 1] - self.vertex_edge_offsets[v]) as usize
+    }
+
+    #[inline]
+    pub fn vertex_edges_of(&self, v: usize) -> &[u32] {
+        self.vertex_edges(v)
+    }
+
+    #[inline]
+    pub fn face_edges_of(&self, f: usize) -> &[u32] {
+        self.face_edges(f)
+    }
+
+    #[inline]
+    pub fn other_vertex(&self, e: u32, v: u32) -> u32 {
+        let [a, b] = self.edge_vertices[e as usize];
+        if a == v { b } else { a }
+    }
+
+    #[inline]
+    pub fn face_vertices(&self, f: usize) -> &[u32] {
+        &self.face_vertices[self.face_vertex_offsets[f] as usize..self.face_vertex_offsets[f + 1] as usize]
+    }
+
+    #[inline]
+    pub fn vertex_faces(&self, v: usize) -> &[u32] {
+        &self.vertex_faces[self.vertex_face_offsets[v] as usize..self.vertex_face_offsets[v + 1] as usize]
     }
 
     #[inline]
