@@ -75,6 +75,10 @@ pub struct Sat {
     max_learnts: f64,
     ok: bool,
     pub conflicts: u64,
+    // Literals assumed true for the current solve (decided first, in order)
+    assumptions: Vec<Lit>,
+    // Set when the current solve found the assumptions can't all hold (unlike `ok`, only for this solve)
+    assumptions_failed: bool,
 }
 
 const NOT_IN_HEAP: u32 = u32::MAX;
@@ -104,11 +108,39 @@ impl Sat {
             max_learnts: 0.0,
             ok: true,
             conflicts: 0,
+            assumptions: Vec::new(),
+            assumptions_failed: false,
         };
         for v in 0..num_vars as u32 {
             sat.heap_insert(v);
         }
         sat
+    }
+
+    /// Adds a variable, returning it
+    pub fn new_var(&mut self) -> u32 {
+        let v = self.assigns.len() as u32;
+        self.watches.push(Vec::new());
+        self.watches.push(Vec::new());
+        self.assigns.push(Lbool::Undef);
+        self.level.push(0);
+        self.reason.push(NO_REASON);
+        self.activity.push(0.0);
+        self.polarity.push(true);
+        self.heap_index.push(NOT_IN_HEAP);
+        self.seen.push(0);
+        self.heap_insert(v);
+        v
+    }
+
+    /// Number of clauses (including learnt ones)
+    pub fn clause_count(&self) -> usize {
+        self.clauses.len() - self.free_clauses.len()
+    }
+
+    /// Which value the solver tries first for a variable (until conflicts change it)
+    pub fn set_preferred_value(&mut self, v: u32, value: bool) {
+        self.polarity[v as usize] = !value;
     }
 
     pub fn num_vars(&self) -> usize {
@@ -578,6 +610,15 @@ impl Sat {
 
     /// Solves, giving up after `conflict_budget` more conflicts. On Sat, `model_value` gives the assignment.
     pub fn solve(&mut self, conflict_budget: u64) -> SolveStatus {
+        self.solve_assuming(&[], conflict_budget)
+    }
+
+    /// Solves with the literals assumed true. Unsat means unsatisfiable under the assumptions (clauses added since stay
+    /// valid without them, so the solver can be reused with other assumptions).
+    pub fn solve_assuming(&mut self, assumptions: &[Lit], conflict_budget: u64) -> SolveStatus {
+        self.assumptions.clear();
+        self.assumptions.extend_from_slice(assumptions);
+        self.assumptions_failed = false;
         if !self.ok {
             return SolveStatus::Unsat;
         }
@@ -597,7 +638,11 @@ impl Sat {
             match self.search(limit as u64, budget_end) {
                 Lbool::True => return SolveStatus::Sat,
                 Lbool::False => {
-                    self.ok = false;
+                    if self.assumptions_failed {
+                        self.cancel_until(0);
+                    } else {
+                        self.ok = false;
+                    }
                     return SolveStatus::Unsat;
                 }
                 Lbool::Undef => {
@@ -641,7 +686,27 @@ impl Sat {
                     self.reduce_learnts();
                     self.max_learnts *= 1.1;
                 }
-                match self.pick_branch() {
+                // Assumptions first, one decision level each
+                let mut next = None;
+                while (self.decision_level() as usize) < self.assumptions.len() {
+                    let p = self.assumptions[self.decision_level() as usize];
+                    match self.value(p) {
+                        // Already true: an empty decision level
+                        Lbool::True => self.trail_lim.push(self.trail.len()),
+                        Lbool::False => {
+                            self.assumptions_failed = true;
+                            return Lbool::False;
+                        }
+                        Lbool::Undef => {
+                            next = Some(p);
+                            break;
+                        }
+                    }
+                }
+                if next.is_none() {
+                    next = self.pick_branch();
+                }
+                match next {
                     None => return Lbool::True,
                     Some(l) => {
                         self.trail_lim.push(self.trail.len());

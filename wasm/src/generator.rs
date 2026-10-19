@@ -12,7 +12,7 @@
 
 use crate::cansolve::{self, RuleSet};
 use crate::engine;
-use crate::solver::{self, Board, SolveResult, WHITE};
+use crate::solver::{Board, SolutionCounter, Uniqueness};
 use crate::topology::Topology;
 
 pub const NO_VALUE: u8 = 0xff;
@@ -67,6 +67,12 @@ pub struct Generator {
     pub events: Vec<u32>,
     // Loops found by SAT solves: each loop's number of edges around each face, and its sorted edges
     known: Vec<(Vec<u8>, Vec<u32>)>,
+    // Minimization: the values it started from, faces whose values are kept, and the incremental uniqueness checker
+    minimize_start_values: Vec<u8>,
+    kept: Vec<bool>,
+    uniqueness: Option<Uniqueness>,
+    // Solution counting while adding values
+    counter: Option<SolutionCounter>,
 }
 
 impl Generator {
@@ -87,6 +93,10 @@ impl Generator {
             phase: Phase::Failed,
             events: Vec::new(),
             known: Vec::new(),
+            minimize_start_values: Vec::new(),
+            kept: vec![false; board.num_faces],
+            uniqueness: None,
+            counter: None,
         };
         generator.resume(board, topology, rules, resume);
         generator
@@ -144,7 +154,7 @@ impl Generator {
                     .filter(|&f| minimized[f as usize].is_none())
                     .collect();
                 self.shuffle(&mut order);
-                self.phase = Phase::Minimize { order, position: 0 };
+                self.start_minimize(order);
                 return;
             }
             // Couldn't resume
@@ -292,8 +302,15 @@ impl Generator {
         }
         let mut order: Vec<u32> = (0..board.num_faces as u32).collect();
         self.shuffle(&mut order);
-        self.phase = Phase::Minimize { order, position: 0 };
+        self.start_minimize(order);
         Status::Running
+    }
+
+    fn start_minimize(&mut self, order: Vec<u32>) {
+        self.minimize_start_values = self.face_values.clone();
+        self.kept.fill(false);
+        self.uniqueness = None;
+        self.phase = Phase::Minimize { order, position: 0 };
     }
 
     fn minimize_step(
@@ -314,9 +331,16 @@ impl Generator {
             self.emit(EVENT_MINIMIZE, face as u32, NO_VALUE);
         } else {
             self.face_values[face] = NO_VALUE;
-            let unique = matches!(self.solution_count(board), Some((1, _)));
+            // Cheapest first: known loops showing multiple solutions, the difficulty check, then whether SAT finds a
+            // solution other than the known one
             let values = self.face_values.clone();
-            if unique && self.can_solve(board, topology, rules, &values) {
+            let removable = !self.known_multiple(&values)
+                && self.is_unique(board, &values)
+                && self.can_solve(board, topology, rules, &values);
+            if !removable {
+                self.kept[face] = true;
+            }
+            if removable {
                 self.emit(EVENT_MINIMIZE, face as u32, NO_VALUE);
             } else {
                 self.face_values[face] = value;
@@ -355,23 +379,33 @@ impl Generator {
         Some((count, solution))
     }
 
+    // Whether the known solution is the only one (false if the SAT solver gave up), with the minimization's incremental
+    // uniqueness checker
+    fn is_unique(&mut self, board: &Board, values: &[u8]) -> bool {
+        let _timer = profile::Timer::new(0);
+        if self.uniqueness.is_none() {
+            self.uniqueness = Some(Uniqueness::new(board, &self.minimize_start_values, &self.solution));
+        }
+        let active: Vec<bool> = values.iter().map(|&v| v != NO_VALUE).collect();
+        let kept = self.kept.clone();
+        matches!(
+            self.uniqueness
+                .as_mut()
+                .unwrap()
+                .is_unique(board, &active, &kept, 10000),
+            Some(true)
+        )
+    }
+
     // Up to two solutions (remembering them), or None if the SAT solver gave up
     fn solutions(&mut self, board: &Board, values: &[u8]) -> Option<Vec<Vec<u32>>> {
         let _timer = profile::Timer::new(0);
-        let face_values: Vec<i8> = values
-            .iter()
-            .map(|&v| if v == NO_VALUE { -1 } else { v as i8 })
-            .collect();
-        let edge_states = vec![WHITE; board.num_edges];
-        match solver::solve(board, &face_values, &edge_states, 2, 10000, u64::MAX).0 {
-            SolveResult::Solutions(solutions) => {
-                for solution in &solutions {
-                    self.remember(board, solution);
-                }
-                Some(solutions)
-            }
-            SolveResult::BudgetExceeded => None,
+        let counter = self.counter.get_or_insert_with(|| SolutionCounter::new(board));
+        let solutions = counter.solutions(board, values, 2, 10000)?;
+        for solution in &solutions {
+            self.remember(board, solution);
         }
+        Some(solutions)
     }
 
     fn remember(&mut self, board: &Board, solution: &[u32]) {
