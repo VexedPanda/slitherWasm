@@ -1,10 +1,10 @@
 import { TRedLineStyle } from '../Theme.ts';
+import { ChunkedPaths, Chunking } from './ChunkedPaths.ts';
 import { TPuzzleStyle } from './TPuzzleStyle.ts';
 
 import { Multilink, TReadOnlyProperty } from 'scenerystack/axon';
 import { Vector2 } from 'scenerystack/dot';
-import { Shape } from 'scenerystack/kite';
-import { Node, Path } from 'scenerystack/scenery';
+import { Node } from 'scenerystack/scenery';
 
 import { TBoard } from '../../model/board/core/TBoard.ts';
 import { TState } from '../../model/data/core/TState.ts';
@@ -18,20 +18,26 @@ export class EdgeViewNode extends Node {
     isSolvedProperty: TReadOnlyProperty<boolean>,
     style: TPuzzleStyle,
   ) {
-    const whitePath = new Path(null, {
+    // Drawn in chunks of nearby edges, so a move only rebuilds the chunks it changed
+    const chunking = new Chunking(
+      board.edges.map((edge) => edge.start.viewCoordinates.blend(edge.end.viewCoordinates, 0.5)),
+    );
+
+    const whitePath = new ChunkedPaths(chunking, {
       lineWidth: 0.02,
       stroke: style.theme.whiteLineColorProperty,
     });
 
-    const redXPath = new Path(null, {
+    const redXPath = new ChunkedPaths(chunking, {
       stroke: style.theme.xColorProperty,
       lineWidth: 0.025,
     });
 
-    const redLinePath = new Path(null, {
+    const redLinePath = new ChunkedPaths(chunking, {
       lineWidth: 0.02,
       fill: style.theme.redLineColorProperty,
     });
+    const paths = [whitePath, redXPath, redLinePath];
 
     super({
       children: [whitePath, redXPath, redLinePath],
@@ -71,45 +77,49 @@ export class EdgeViewNode extends Node {
             if (edgeState !== edgeStates[i]) {
               changed = true;
               edgeStates[i] = edgeState;
+              paths.forEach((path) => path.markItemDirty(i));
             }
           }
 
+          // Style changes redraw everything
+          let styleChanged = false;
           if (alignedXs !== redXsAligned) {
-            changed = true;
+            styleChanged = true;
             alignedXs = redXsAligned;
           }
           if (showedWhiteLines !== whiteLineVisible) {
-            changed = true;
+            styleChanged = true;
             showedWhiteLines = whiteLineVisible;
           }
           if (showedRedXs !== redXsVisible) {
-            changed = true;
+            styleChanged = true;
             showedRedXs = redXsVisible;
           }
           if (showedRedLines !== redLineVisible) {
-            changed = true;
+            styleChanged = true;
             showedRedLines = redLineVisible;
           }
           if (showedRedLineStyle !== redLineStyle) {
-            changed = true;
+            styleChanged = true;
             showedRedLineStyle = redLineStyle;
           }
 
+          if (styleChanged) {
+            changed = true;
+            paths.forEach((path) => path.markAllDirty());
+          }
+
           if (changed) {
-            const whiteShape = new Shape();
-            const redXShape = new Shape();
-            const redLineShape = new Shape();
-
-            for (let i = 0; i < board.edges.length; i++) {
-              const edgeState = edgeStates[i];
-
-              if (whiteLineVisible && edgeState === EdgeState.WHITE) {
+            whitePath.update((whiteShape, i) => {
+              if (whiteLineVisible && edgeStates[i] === EdgeState.WHITE) {
                 const edge = board.edges[i];
                 whiteShape.moveTo(edge.start.viewCoordinates.x, edge.start.viewCoordinates.y);
                 whiteShape.lineTo(edge.end.viewCoordinates.x, edge.end.viewCoordinates.y);
               }
+            });
 
-              if (edgeState === EdgeState.RED) {
+            redXPath.update((redXShape, i) => {
+              if (edgeStates[i] === EdgeState.RED) {
                 if (redXsVisible) {
                   const edge = board.edges[i];
                   const halfSize = 0.07;
@@ -135,7 +145,11 @@ export class EdgeViewNode extends Node {
                     redXShape.lineTo(center.x + halfSize, center.y - halfSize);
                   }
                 }
+              }
+            });
 
+            redLinePath.update((redLineShape, i) => {
+              if (edgeStates[i] === EdgeState.RED) {
                 if (redLineVisible) {
                   // TODO: ditch style property?
 
@@ -154,15 +168,7 @@ export class EdgeViewNode extends Node {
                   }
                 }
               }
-            }
-
-            whiteShape.makeImmutable();
-            redXShape.makeImmutable();
-            redLineShape.makeImmutable();
-
-            whitePath.shape = whiteShape;
-            redXPath.shape = redXShape;
-            redLinePath.shape = redLineShape;
+            });
           }
         }
       },

@@ -71,6 +71,36 @@ import assert, { assertEnabled } from '../../workarounds/assert.ts';
 
 import { getHintWorker, hintWorkerLoadedProperty } from '../../workers/getHintWorker.ts';
 
+// Saving the puzzle serializes and compresses the whole board, which is slow on large boards, so it's done once moves
+// pause (the latest puzzle's save wins), and right away if the page is hidden or closed
+const SAVE_DELAY = 500;
+let pendingSave: (() => void) | null = null;
+let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+const flushSave = () => {
+  if (saveTimeout !== null) {
+    clearTimeout(saveTimeout);
+    saveTimeout = null;
+  }
+  const save = pendingSave;
+  pendingSave = null;
+  save?.();
+};
+const saveSoon = (save: () => void) => {
+  pendingSave = save;
+  if (saveTimeout !== null) {
+    clearTimeout(saveTimeout);
+  }
+  saveTimeout = setTimeout(flushSave, SAVE_DELAY);
+};
+if (typeof document !== 'undefined') {
+  addEventListener('pagehide', flushSave);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      flushSave();
+    }
+  });
+}
+
 export const uiHintUsesBuiltInSolveProperty = new LocalStorageBooleanProperty('uiHintUsesBuiltInSolve', false);
 export const showUndoRedoAllProperty = new LocalStorageBooleanProperty('showUndoRedoAllProperty', false);
 
@@ -294,9 +324,7 @@ export default class PuzzleModel<
 
     this.puzzle.stateProperty.value = this.stack[this.stackPositionProperty.value].state;
 
-    setTimeout(() => {
-      localStorage.setItem('puzzleString', puzzleToCompressedString(this.puzzle));
-    }, 0);
+    saveSoon(() => localStorage.setItem('puzzleString', puzzleToCompressedString(this.puzzle)));
   }
 
   private wipeStackTop(): void {
