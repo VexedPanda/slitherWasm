@@ -304,7 +304,7 @@ pub fn solve_excluding(
         clause.extend(known.iter().map(|&e| neg(e)));
         ok &= sat.add_clause(&clause);
         for e in 0..board.num_edges as u32 {
-            sat.set_preferred_value(e, !in_known[e as usize]);
+            sat.set_preferred_value(e, in_known[e as usize]);
         }
     }
 
@@ -436,6 +436,9 @@ pub struct Uniqueness {
 
 const NO_SELECTOR: u32 = u32::MAX;
 
+// Conflicts a uniqueness check may take before giving up
+const UNIQUENESS_CONFLICT_BUDGET: u64 = 20_000;
+
 impl Uniqueness {
     /// From the full puzzle (0xff for faces without values) and its solution
     pub fn new(board: &Board, values: &[u8], solution: &[u32]) -> Uniqueness {
@@ -502,7 +505,7 @@ impl Uniqueness {
         clause.extend(solution.iter().map(|&e| neg(e)));
         sat.add_clause(&clause);
         for e in 0..board.num_edges as u32 {
-            sat.set_preferred_value(e, !in_known[e as usize]);
+            sat.set_preferred_value(e, in_known[e as usize]);
         }
 
         Uniqueness {
@@ -515,6 +518,24 @@ impl Uniqueness {
     /// Whether the known solution is the only one with the values of the active faces. `kept` faces will keep their
     /// values (so exclusions guarded by them stay useful). None if the solver gave up.
     pub fn is_unique(&mut self, board: &Board, active: &[bool], kept: &[bool], max_iterations: u64) -> Option<bool> {
+        #[cfg(feature = "profile")]
+        let start = std::time::Instant::now();
+        let result = self.is_unique_inner(board, active, kept, max_iterations);
+        #[cfg(feature = "profile")]
+        if start.elapsed().as_millis() > 50 {
+            eprintln!(
+                "  uniqueness: {} values, {:?} in {} ms",
+                active.iter().filter(|&&a| a).count(),
+                result,
+                start.elapsed().as_millis()
+            );
+        }
+        result
+    }
+
+    fn is_unique_inner(&mut self, board: &Board, active: &[bool], kept: &[bool], max_iterations: u64) -> Option<bool> {
+        // Proofs that need very many conflicts are given up on (the caller then treats the puzzle as maybe not unique)
+        let budget_end = self.sat.conflicts + UNIQUENESS_CONFLICT_BUDGET;
         let assumptions: Vec<u32> = (0..board.num_faces)
             .filter(|&f| active[f] && self.selectors[f] != NO_SELECTOR)
             .map(|f| lit(self.selectors[f], false))
@@ -528,7 +549,10 @@ impl Uniqueness {
         let mut visited = vec![false; board.num_edges];
         let mut clause: Vec<u32> = Vec::new();
         for _ in 0..max_iterations {
-            match self.sat.solve_assuming(&assumptions, u64::MAX) {
+            match self
+                .sat
+                .solve_assuming(&assumptions, budget_end.saturating_sub(self.sat.conflicts))
+            {
                 SolveStatus::Unsat => return Some(true),
                 SolveStatus::Unknown => return None,
                 SolveStatus::Sat => {}
@@ -636,6 +660,9 @@ pub struct SolutionCounter {
     num_edges: usize,
     // (face, value) => selector variable
     selectors: Vec<[u32; 16]>,
+    /// Set when a count stopped at its round limit: the last model (possibly several loops), which differs from the known
+    /// solution
+    pub witness_model: Option<Vec<u32>>,
 }
 
 // Start over with a new solver past this many clauses (retired ones still take memory)
@@ -663,6 +690,7 @@ impl SolutionCounter {
             sat,
             num_edges: board.num_edges,
             selectors: vec![[NO_SELECTOR; 16]; board.num_faces],
+            witness_model: None,
         }
     }
 
@@ -697,13 +725,20 @@ impl SolutionCounter {
     }
 
     /// Up to max_solutions solutions (each a loop's edges) for these values (0xff for none), or None if it gave up
+    /// Up to max_solutions solutions (each a loop's edges) for these values (0xff for none), or None if it gave up. With a
+    /// known solution, only finds others (see solve_excluding).
     pub fn solutions(
         &mut self,
         board: &Board,
         values: &[u8],
         max_solutions: usize,
         max_iterations: u64,
+        known: Option<&[u32]>,
+        // With a known solution: stop after this many models without finding another solution, keeping the last model
+        // in witness_model
+        witness_rounds: u64,
     ) -> Option<Vec<Vec<u32>>> {
+        self.witness_model = None;
         if !values.iter().any(|&v| v != 0xff && v > 0) {
             return Some(Vec::new());
         }
@@ -719,6 +754,22 @@ impl SolutionCounter {
         }
         let call = self.sat.new_var();
         assumptions.push(lit(call, false));
+        if let Some(known) = known {
+            // For this count: not the known solution (nor it plus another loop), trying its opposite first
+            let mut in_known = vec![false; self.num_edges];
+            for &e in known {
+                in_known[e as usize] = true;
+            }
+            let mut clause = vec![lit(call, true)];
+            clause.extend((0..self.num_edges as u32).filter(|&e| !in_known[e as usize]).map(pos));
+            self.sat.add_clause(&clause);
+            let mut clause = vec![lit(call, true)];
+            clause.extend(known.iter().map(|&e| neg(e)));
+            self.sat.add_clause(&clause);
+            for e in 0..self.num_edges as u32 {
+                self.sat.set_preferred_value(e, in_known[e as usize]);
+            }
+        }
 
         let touches_value = |e: u32| {
             board.edge_faces[e as usize]
@@ -730,7 +781,16 @@ impl SolutionCounter {
         let mut solutions: Vec<Vec<u32>> = Vec::new();
         let mut clause: Vec<u32> = Vec::new();
         let mut result = None;
+        let mut rounds_done = 0u64;
+        #[cfg(feature = "profile")]
+        let (start, start_conflicts) = (std::time::Instant::now(), self.sat.conflicts);
+        #[cfg(feature = "profile")]
+        let mut rounds = 0;
         for _ in 0..max_iterations {
+            #[cfg(feature = "profile")]
+            {
+                rounds += 1;
+            }
             match self.sat.solve_assuming(&assumptions, u64::MAX) {
                 SolveStatus::Unsat => {
                     result = Some(solutions);
@@ -824,7 +884,22 @@ impl SolutionCounter {
                 result = Some(solutions);
                 break;
             }
+            if known.is_some() && rounds_done + 1 >= witness_rounds {
+                self.witness_model = Some(model_edges);
+                result = Some(solutions);
+                break;
+            }
+            rounds_done += 1;
         }
+        #[cfg(feature = "profile")]
+        eprintln!(
+            "count: {} values, {} rounds, {} conflicts, {:.0} ms, {:?} solutions",
+            values.iter().filter(|&&v| v != 0xff).count(),
+            rounds,
+            self.sat.conflicts - start_conflicts,
+            start.elapsed().as_secs_f64() * 1000.0,
+            result.as_ref().map(|r: &Vec<Vec<u32>>| r.len())
+        );
         // Retire this count's variable (its clauses no longer apply)
         self.sat.add_clause(&[lit(call, true)]);
         result

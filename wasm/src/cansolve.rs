@@ -12,7 +12,7 @@ use crate::solver::Board;
 const NO_FACE_VALUE: u8 = 0xff;
 
 // Edge state
-const WHITE: u8 = 0;
+pub const WHITE: u8 = 0;
 const BLACK: u8 = 1;
 const RED: u8 = 2;
 
@@ -46,6 +46,8 @@ pub struct RuleSet {
 impl RuleSet {
     /// Parses the clauses from compilePatternRules.ts.
     pub fn new(num_edges: usize, num_sectors: usize, data: &[u32], clause_count: usize) -> RuleSet {
+        let (merged, clause_count) = merge_clauses(data, clause_count);
+        let data = &merged[..];
         let num_atoms = 2 * num_edges + 3 * num_sectors;
         let mut rules = RuleSet {
             num_atoms,
@@ -217,6 +219,7 @@ impl RuleSet {
 pub struct Invalid;
 
 struct Checker<'a> {
+    sound: bool,
     board: &'a Board,
     rules: &'a RuleSet,
     face_values: &'a [u8],
@@ -242,7 +245,23 @@ struct Checker<'a> {
 
 /// Whether the rules solve the puzzle with these face values (0xff for none)
 pub fn can_solve(board: &Board, rules: &RuleSet, face_values: &[u8]) -> Result<bool, Invalid> {
+    Ok(deduce(board, rules, face_values, false)?.solved)
+}
+
+/// The result of applying the rules
+pub struct Deduction {
+    // The black edges form one closed loop
+    pub solved: bool,
+    // Final edge states (white for undecided)
+    pub edge_state: Vec<u8>,
+}
+
+/// Applies the rules. When `sound`, only deductions that hold whether or not the puzzle is unique are made (no closing
+/// loops by SimpleLoopSolver's "solve to black", and the rules should have no highlander rules), so if that solves the
+/// puzzle, it's unique.
+pub fn deduce(board: &Board, rules: &RuleSet, face_values: &[u8], sound: bool) -> Result<Deduction, Invalid> {
     let mut checker = Checker {
+        sound,
         board,
         rules,
         face_values,
@@ -271,7 +290,10 @@ pub fn can_solve(board: &Board, rules: &RuleSet, face_values: &[u8]) -> Result<b
     }
     checker.init_clauses()?;
     checker.run()?;
-    Ok(checker.is_solved())
+    Ok(Deduction {
+        solved: checker.is_solved(),
+        edge_state: checker.edge_state,
+    })
 }
 
 impl Checker<'_> {
@@ -582,7 +604,12 @@ impl Checker<'_> {
                     current = board.other_vertex(forced, current);
                 }
                 if current == b {
-                    let fill = if self.solved_with_path(a, &path) { BLACK } else { RED };
+                    let solved = self.solved_with_path(a, &path);
+                    if solved && self.sound {
+                        // (closing it assumes the puzzle is unique)
+                        continue;
+                    }
+                    let fill = if solved { BLACK } else { RED };
                     for &e in &path {
                         self.set_edge(e, fill)?;
                     }
@@ -641,4 +668,147 @@ impl Checker<'_> {
     fn is_solved(&self) -> bool {
         self.closed_loops == 1 && (0..self.board.num_vertices).all(|v| self.vblack[v] != 1)
     }
+}
+
+// Spans of one encoded clause (see compilePatternRules.ts): (start, end) word ranges of its face conditions, faces, body,
+// head, color conditions and color outputs, and its pattern face count
+struct ClauseSpans {
+    face_conditions: (usize, usize),
+    faces: (usize, usize),
+    body: (usize, usize),
+    head: (usize, usize),
+    color_conditions: (usize, usize),
+    color_outputs: (usize, usize),
+    pattern_face_count: u32,
+}
+
+fn clause_spans(data: &[u32], start: usize) -> (ClauseSpans, usize) {
+    let mut i = start;
+    let mut span = |size: usize| {
+        let count = data[i] as usize * size;
+        let range = (i + 1, i + 1 + count);
+        i += 1 + count;
+        range
+    };
+    let face_conditions = span(2);
+    let faces = span(1);
+    let body = span(1);
+    let head = span(1);
+    let color_conditions = span(3);
+    let color_outputs = span(3);
+    let spans = ClauseSpans {
+        face_conditions,
+        faces,
+        body,
+        head,
+        color_conditions,
+        color_outputs,
+        pattern_face_count: data[i],
+    };
+    (spans, i + 1)
+}
+
+// Merges clauses with the same conditions (e.g. a symmetric rule's equivalent embeddings), combining their outputs. The
+// compiler writes each list sorted, so equal conditions are equal word sequences.
+fn merge_clauses(data: &[u32], clause_count: usize) -> (Vec<u32>, usize) {
+    let mut starts = Vec::with_capacity(clause_count);
+    let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(clause_count);
+    let mut i = 0;
+    for index in 0..clause_count {
+        starts.push(i as u32);
+        let (spans, next) = clause_spans(data, i);
+        // FNV-1a over the conditions
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for (start, end) in [spans.face_conditions, spans.faces, spans.body, spans.color_conditions] {
+            hash = (hash ^ (end - start) as u64).wrapping_mul(0x100_0000_01b3);
+            for &word in &data[start..end] {
+                hash = (hash ^ word as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        hash = (hash ^ spans.pattern_face_count as u64).wrapping_mul(0x100_0000_01b3);
+        keyed.push((hash, index as u32));
+        i = next;
+    }
+    keyed.sort_unstable();
+
+    let same_conditions = |a: &ClauseSpans, b: &ClauseSpans| {
+        let slice = |(start, end): (usize, usize)| &data[start..end];
+        a.pattern_face_count == b.pattern_face_count
+            && slice(a.face_conditions) == slice(b.face_conditions)
+            && slice(a.faces) == slice(b.faces)
+            && slice(a.body) == slice(b.body)
+            && slice(a.color_conditions) == slice(b.color_conditions)
+    };
+
+    let mut output: Vec<u32> = Vec::with_capacity(data.len() / 2);
+    let mut merged_count = 0;
+    let mut group_start = 0;
+    let mut used = vec![false; 0];
+    while group_start < keyed.len() {
+        let mut group_end = group_start + 1;
+        while group_end < keyed.len() && keyed[group_end].0 == keyed[group_start].0 {
+            group_end += 1;
+        }
+        let group = &keyed[group_start..group_end];
+        used.clear();
+        used.resize(group.len(), false);
+        for a in 0..group.len() {
+            if used[a] {
+                continue;
+            }
+            let (first, _) = clause_spans(data, starts[group[a].1 as usize] as usize);
+            let mut head: Vec<u32> = data[first.head.0..first.head.1].to_vec();
+            let mut color_outputs: Vec<[u32; 3]> = data[first.color_outputs.0..first.color_outputs.1]
+                .chunks(3)
+                .map(|c| [c[0], c[1], c[2]])
+                .collect();
+            for b in a + 1..group.len() {
+                if used[b] {
+                    continue;
+                }
+                let (other, _) = clause_spans(data, starts[group[b].1 as usize] as usize);
+                if same_conditions(&first, &other) {
+                    used[b] = true;
+                    head.extend_from_slice(&data[other.head.0..other.head.1]);
+                    color_outputs.extend(
+                        data[other.color_outputs.0..other.color_outputs.1]
+                            .chunks(3)
+                            .map(|c| [c[0], c[1], c[2]]),
+                    );
+                }
+            }
+            head.sort_unstable();
+            head.dedup();
+            color_outputs.sort_unstable();
+            color_outputs.dedup();
+
+            let mut push_span = |(start, end): (usize, usize), size: usize| {
+                output.push(((end - start) / size) as u32);
+                output.extend_from_slice(&data[start..end]);
+            };
+            push_span(first.face_conditions, 2);
+            push_span(first.faces, 1);
+            push_span(first.body, 1);
+            output.push(head.len() as u32);
+            output.extend_from_slice(&head);
+            push_span_values(
+                &mut output,
+                &data[first.color_conditions.0..first.color_conditions.1],
+                3,
+            );
+            output.push(color_outputs.len() as u32);
+            for relation in &color_outputs {
+                output.extend_from_slice(relation);
+            }
+            output.push(first.pattern_face_count);
+            merged_count += 1;
+        }
+        group_start = group_end;
+    }
+    (output, merged_count)
+}
+
+fn push_span_values(output: &mut Vec<u32>, values: &[u32], size: usize) {
+    output.push((values.len() / size) as u32);
+    output.extend_from_slice(values);
 }

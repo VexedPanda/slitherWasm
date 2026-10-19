@@ -65,13 +65,31 @@ fn main() {
             easier_header[1] as usize,
         ))
     };
+    let sound_header = next();
+    let sound_clauses = next();
+    let sound = if sound_header.is_empty() {
+        None
+    } else {
+        Some(RuleSet::new(
+            ne,
+            sound_header[0] as usize,
+            &sound_clauses,
+            sound_header[1] as usize,
+        ))
+    };
+    let use_sound = std::env::var("NO_SOUND").is_err();
     let rule_sets = Rules {
-        main: Some(&rules),
+        main: if check == Check::None { None } else { Some(&rules) },
         easier: easier.as_ref(),
+        sound: if use_sound { sound.as_ref() } else { None },
+        sound_implies_difficulty: true,
+        sound_only: check != Check::None && std::env::var("SAT_FALLBACK").is_err(),
     };
 
     let start = std::time::Instant::now();
+    let mut worst = 0.0f64;
     for seed in 1..=count {
+        let puzzle_start = std::time::Instant::now();
         let mut generator = Generator::new(&board, Some(&topology), rule_sets, check, seed * 7919, &[]);
         loop {
             generator.events.clear();
@@ -81,7 +99,10 @@ fn main() {
                 Status::Failed => panic!("failed"),
             }
         }
+        eprintln!("seed {seed}: {:.2} s", puzzle_start.elapsed().as_secs_f64());
+        worst = worst.max(puzzle_start.elapsed().as_secs_f64());
     }
+    println!("worst {:.2} s", worst);
     println!("{:.2} s per puzzle", start.elapsed().as_secs_f64() / count as f64);
     #[cfg(feature = "profile")]
     {
@@ -99,6 +120,9 @@ fn main() {
                 println!("    HARD engine {:35} {:.2} s per puzzle", name, total / count as f64);
             }
         }
-        println!("    HARD engine counts per puzzle: {:?}", unsafe { slither_core::engine::profile::COUNTS }.map(|c| c / count));
+        println!(
+            "    HARD engine counts per puzzle: {:?}",
+            unsafe { slither_core::engine::profile::COUNTS }.map(|c| c / count)
+        );
     }
 }

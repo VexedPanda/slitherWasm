@@ -33,6 +33,16 @@ pub enum Check {
 
 // Most recent loops are checked first, and the oldest are dropped past this (as in KnownSolutions.ts)
 const MAX_KNOWN_SOLUTIONS: usize = 200;
+// Models tried while looking for another solution, before using the last one (not a solution) as the next witness
+const WITNESS_ROUNDS: u64 = 256;
+// The most values added at once from a witness solution
+const MAX_WITNESS_VALUES: usize = 256;
+// Witness values added at once: this fraction (1 / WITNESS_DIVISOR) of the faces where the witnesses differ
+const WITNESS_DIVISOR: usize = 2;
+// Values added at once while guided by the sound rules: this fraction (1 / GUIDED_DIVISOR) of the candidate faces
+const GUIDED_DIVISOR: usize = 8;
+// Models a minimization uniqueness check may exclude before giving up (keeping the value)
+const UNIQUENESS_ROUNDS: u64 = 100;
 // The most values minimization tries to remove at once
 const MAX_MINIMIZE_BLOCK: usize = 32;
 // Give up on an additive pass after this many (as in generateFaceAdditive.ts)
@@ -43,6 +53,16 @@ const MAX_ADDITIVE_ATTEMPTS: u32 = 100;
 pub struct Rules<'a> {
     pub main: Option<&'a RuleSet>,
     pub easier: Option<&'a RuleSet>,
+    /// Rules without uniqueness assumptions (no highlander rules), EASY/MEDIUM-style: if they solve a puzzle, it's
+    /// unique, which avoids most SAT checks (see cansolve::deduce)
+    pub sound: Option<&'a RuleSet>,
+    /// Whether puzzles the sound rules solve also pass the difficulty check (the sound rules are a subset of its rules)
+    pub sound_implies_difficulty: bool,
+    /// Whether minimization only removes values while the sound rules still solve the puzzle (no SAT), so the puzzle
+    /// is solvable without the uniqueness-assuming (highlander) rules. Otherwise, when they can't, it falls back to the
+    /// difficulty check and SAT. With sound_implies_difficulty, the sound rules are then the whole difficulty check (the
+    /// main and easier rules are unused).
+    pub sound_only: bool,
 }
 
 pub enum Status {
@@ -56,6 +76,10 @@ enum Phase {
     Additive {
         order: Vec<u32>,
         position: usize,
+        attempts: u32,
+    },
+    // Adding values from a known solution, where the sound rules can't yet tell (see guided_step)
+    Guided {
         attempts: u32,
     },
     Minimize {
@@ -84,8 +108,10 @@ pub struct Generator {
     counter: Option<SolutionCounter>,
     // Values to try removing at once while minimizing
     block: usize,
-    // Two solutions of the current values, while adding values
+    // Two solutions of the current values, while adding values (the second may instead be a model with several loops,
+    // in which case only the first is a solution)
     witnesses: Option<(Vec<u32>, Vec<u32>)>,
+    second_witness_is_solution: bool,
 }
 
 impl Generator {
@@ -112,6 +138,7 @@ impl Generator {
             counter: None,
             block: 1,
             witnesses: None,
+            second_witness_is_solution: true,
         };
         generator.resume(board, topology, rules, resume);
         generator
@@ -227,6 +254,7 @@ impl Generator {
                 position,
                 attempts,
             } => self.additive_step(board, topology, rules, order, position, attempts),
+            Phase::Guided { attempts } => self.guided_step(board, topology, rules, attempts),
             Phase::Minimize { order, position } => self.minimize_step(board, topology, rules, order, position),
             Phase::Done => {
                 self.phase = Phase::Done;
@@ -247,16 +275,49 @@ impl Generator {
         position: usize,
         attempts: u32,
     ) -> Status {
-        if let Some((face, value)) = self.witness_value(board) {
-            self.face_values[face] = value;
-            match self.solution_count(board) {
-                Some(solutions) if !solutions.is_empty() => {
-                    self.emit(EVENT_DEFINE, face as u32, value);
+        if let Some((additions, kept)) = self.witness_values(board) {
+            for &(face, value) in &additions {
+                self.face_values[face] = value;
+            }
+            // The kept solution is still a solution: is there another?
+            let values = self.face_values.clone();
+            let others = {
+                let _timer = profile::Timer::new(0);
+                let counter = self.counter.get_or_insert_with(|| SolutionCounter::new(board));
+                let others = counter.solutions(board, &values, 1, 10000, Some(&kept), WITNESS_ROUNDS);
+                (others, counter.witness_model.take())
+            };
+            match others {
+                (Some(_), Some(model)) => {
+                    // No other solution found quickly: the last model (not a solution, but different) is the next witness
+                    for &(face, value) in &additions {
+                        self.emit(EVENT_DEFINE, face as u32, value);
+                    }
+                    self.witnesses = Some((kept, model));
+                    self.second_witness_is_solution = false;
+                    self.phase = Phase::Additive {
+                        order,
+                        position,
+                        attempts,
+                    };
+                    return Status::Running;
+                }
+                (Some(others), None) => {
+                    for &(face, value) in &additions {
+                        self.emit(EVENT_DEFINE, face as u32, value);
+                    }
+                    for other in &others {
+                        self.remember(board, other);
+                    }
+                    let mut solutions = vec![kept];
+                    solutions.extend(others);
                     return self.after_count(board, topology, rules, solutions, order, position, attempts);
                 }
-                _ => {
+                (None, _) => {
                     // (the SAT solver gave up)
-                    self.face_values[face] = NO_VALUE;
+                    for &(face, _) in &additions {
+                        self.face_values[face] = NO_VALUE;
+                    }
                     self.witnesses = None;
                 }
             }
@@ -306,6 +367,51 @@ impl Generator {
         Status::Running
     }
 
+    // Adds values from the known solution on faces next to edges the sound rules can't decide yet (a fraction of them at
+    // once), until they solve the puzzle, which proves it's unique (like Loopy's generator, which has no SAT solver).
+    fn guided_step(&mut self, board: &Board, topology: Option<&Topology>, rules: Rules, attempts: u32) -> Status {
+        let deduction = {
+            let _timer = profile::Timer::new(5);
+            cansolve::deduce(board, rules.sound.unwrap(), &self.face_values, true)
+        };
+        let Ok(deduction) = deduction else {
+            // (can't happen: the solution satisfies the values)
+            self.emit(EVENT_RESET, 0, 0);
+            self.start_additive(board, attempts + 1);
+            return Status::Running;
+        };
+        if deduction.solved {
+            return self.finish_additive(board, topology, rules);
+        }
+        let counts = Self::face_counts(board, &self.solution);
+        let mut candidates: Vec<u32> = (0..board.num_faces as u32)
+            .filter(|&f| {
+                let f = f as usize;
+                self.face_values[f] == NO_VALUE
+                    && (counts[f] as usize) < board.face_edge_count(f)
+                    && board
+                        .face_edges_of(f)
+                        .iter()
+                        .any(|&e| deduction.edge_state[e as usize] == cansolve::WHITE)
+            })
+            .collect();
+        if candidates.is_empty() {
+            // Undecided edges only next to faces that can't take a value: give up on this solution
+            self.emit(EVENT_RESET, 0, 0);
+            self.start_additive(board, attempts + 1);
+            return Status::Running;
+        }
+        self.shuffle(&mut candidates);
+        let count = candidates.len().div_ceil(GUIDED_DIVISOR);
+        for &f in &candidates[..count] {
+            let value = counts[f as usize];
+            self.face_values[f as usize] = value;
+            self.emit(EVENT_DEFINE, f, value);
+        }
+        self.phase = Phase::Guided { attempts };
+        Status::Running
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn after_count(
         &mut self,
@@ -324,7 +430,14 @@ impl Generator {
         }
         let b = solutions.pop().unwrap();
         let a = solutions.pop().unwrap();
+        if rules.sound.is_some() {
+            // From here, values come from one solution until the sound rules solve it (no more SAT)
+            self.solution = if self.random() & 1 == 0 { a } else { b };
+            self.phase = Phase::Guided { attempts };
+            return Status::Running;
+        }
         self.witnesses = Some((a, b));
+        self.second_witness_is_solution = true;
         self.phase = Phase::Additive {
             order,
             position,
@@ -333,37 +446,47 @@ impl Generator {
         Status::Running
     }
 
-    // A face (without a value) where the two witness solutions have different counts, and one of their counts (not all
-    // of the face's edges), chosen randomly
-    fn witness_value(&mut self, board: &Board) -> Option<(usize, u8)> {
+    // Values to add from one of the two witness solutions (chosen randomly) on faces where their counts differ (not all
+    // of the face's edges): a random quarter of those faces (at least one), so a single count can rule out more than the
+    // other witness. Returns them and the solution they come from.
+    #[allow(clippy::type_complexity)]
+    fn witness_values(&mut self, board: &Board) -> Option<(Vec<(usize, u8)>, Vec<u32>)> {
         let (a, b) = self.witnesses.take()?;
         let counts_a = Self::face_counts(board, &a);
         let counts_b = Self::face_counts(board, &b);
-        let keep_a = self.random() & 1 == 0;
-        let mut candidates: Vec<(usize, u8)> = Vec::new();
-        for keep_first in [keep_a, !keep_a] {
+        // (only a solution can be kept)
+        let keep_a = !self.second_witness_is_solution || self.random() & 1 == 0;
+        let options: &[bool] = if self.second_witness_is_solution {
+            &[keep_a, !keep_a]
+        } else {
+            &[true]
+        };
+        for &keep_first in options {
             let (kept, other) = if keep_first {
                 (&counts_a, &counts_b)
             } else {
                 (&counts_b, &counts_a)
             };
-            candidates = (0..board.num_faces)
+            let mut candidates: Vec<u32> = (0..board.num_faces as u32)
                 .filter(|&f| {
+                    let f = f as usize;
                     self.face_values[f] == NO_VALUE
                         && kept[f] != other[f]
                         && (kept[f] as usize) < board.face_edge_count(f)
                 })
-                .map(|f| (f, kept[f]))
                 .collect();
-            if !candidates.is_empty() {
-                break;
+            if candidates.is_empty() {
+                continue;
             }
+            self.shuffle(&mut candidates);
+            let count = candidates.len().div_ceil(WITNESS_DIVISOR).min(MAX_WITNESS_VALUES);
+            let additions = candidates[..count]
+                .iter()
+                .map(|&f| (f as usize, kept[f as usize]))
+                .collect();
+            return Some((additions, if keep_first { a } else { b }));
         }
-        if candidates.is_empty() {
-            return None;
-        }
-        let index = (self.random() % candidates.len() as u64) as usize;
-        Some(candidates[index])
+        None
     }
 
     fn face_counts(board: &Board, edges: &[u32]) -> Vec<u8> {
@@ -447,11 +570,8 @@ impl Generator {
         for &f in &block {
             self.face_values[f] = NO_VALUE;
         }
-        // Cheapest first: known loops showing multiple solutions, SAT uniqueness, then the difficulty check
         let values = self.face_values.clone();
-        let removable = !self.known_multiple(&values)
-            && self.is_unique(board, &values)
-            && self.can_solve(board, topology, rules, &values);
+        let removable = self.removable(board, topology, rules, &values);
 
         if removable {
             let end = (position + self.block).min(order.len());
@@ -480,10 +600,40 @@ impl Generator {
         Status::Running
     }
 
+    // Whether these values (after removing some) are still unique and solvable at the difficulty. Cheapest first: known
+    // loops showing multiple solutions; the sound rules solving it (which proves it unique, and maybe solvable at the
+    // difficulty); the difficulty check; then SAT uniqueness.
+    fn removable(&mut self, board: &Board, topology: Option<&Topology>, rules: Rules, values: &[u8]) -> bool {
+        if self.known_multiple(values) {
+            return false;
+        }
+        if let Some(sound) = rules.sound {
+            let solved = {
+                let _timer = profile::Timer::new(5);
+                matches!(cansolve::deduce(board, sound, values, true), Ok(d) if d.solved)
+            };
+            if solved {
+                return rules.sound_implies_difficulty || self.can_solve(board, topology, rules, values);
+            }
+            if rules.sound_only {
+                return false;
+            }
+        }
+        self.can_solve(board, topology, rules, values) && self.is_unique(board, values)
+    }
+
     fn can_solve(&self, board: &Board, topology: Option<&Topology>, rules: Rules, values: &[u8]) -> bool {
         let _timer = profile::Timer::new(1);
         if self.check == Check::None {
             return true;
+        }
+        // Sound-only: the sound rules are the check (a subset of the difficulty's rules, so stricter), and the main and
+        // easier rules aren't needed (or loaded)
+        if rules.sound_only
+            && rules.sound_implies_difficulty
+            && let Some(sound) = rules.sound
+        {
+            return matches!(cansolve::deduce(board, sound, values, true), Ok(d) if d.solved);
         }
         // An easier difficulty's rules are a subset of this one's, so if they solve it, so would these (and they're
         // much cheaper)
@@ -518,7 +668,7 @@ impl Generator {
     // Whether the known solution is the only one (false if the SAT solver gave up), with the minimization's incremental
     // uniqueness checker
     fn is_unique(&mut self, board: &Board, values: &[u8]) -> bool {
-        let _timer = profile::Timer::new(0);
+        let _timer = profile::Timer::new(4);
         if self.uniqueness.is_none() {
             self.uniqueness = Some(Uniqueness::new(board, &self.minimize_start_values, &self.solution));
         }
@@ -528,7 +678,7 @@ impl Generator {
             self.uniqueness
                 .as_mut()
                 .unwrap()
-                .is_unique(board, &active, &kept, 10000),
+                .is_unique(board, &active, &kept, UNIQUENESS_ROUNDS),
             Some(true)
         )
     }
@@ -537,7 +687,7 @@ impl Generator {
     fn solutions(&mut self, board: &Board, values: &[u8]) -> Option<Vec<Vec<u32>>> {
         let _timer = profile::Timer::new(0);
         let counter = self.counter.get_or_insert_with(|| SolutionCounter::new(board));
-        let solutions = counter.solutions(board, values, 2, 10000)?;
+        let solutions = counter.solutions(board, values, 2, 10000, None, u64::MAX)?;
         for solution in &solutions {
             self.remember(board, solution);
         }

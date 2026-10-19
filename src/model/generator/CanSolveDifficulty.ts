@@ -37,18 +37,28 @@ const MEDIUM_GROUPS: RuleGroupLimit[] = [
   { group: generalEdgeSectorMixedGroup, size: 50 },
   { group: generalEdgeMixedGroup, size: 360 },
 ];
+// Without the rules that assume uniqueness (subsets of the difficulties' rules), see WasmDifficultyRules.sound
+const withoutHighlander = (groups: RuleGroupLimit[]): RuleGroupLimit[] =>
+  groups.map((limit) => ({ ...limit, withoutHighlander: true }));
 
 const wasmCheck = (
   difficulty: string,
   groups: RuleGroupLimit[],
   hard = false,
   easier?: { key: string; groups: RuleGroupLimit[] },
+  sound?: { key: string; groups: RuleGroupLimit[]; only: boolean },
 ): WasmCheck => {
   const getRules = (board: TBoard): WasmDifficultyRules => ({
     key: difficulty,
     getRules: () => compilePatternRules(board, groups),
     hard: hard,
     easier: easier && { key: easier.key, getRules: () => compilePatternRules(board, easier.groups) },
+    sound: sound && {
+      key: sound.key,
+      getRules: () => compilePatternRules(board, sound.groups),
+      impliesDifficulty: true,
+      only: sound.only,
+    },
   });
   return {
     canSolve: (board, state) => {
@@ -118,7 +128,13 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCheck('EASY', EASY_GROUPS),
+    // Minimizing only while the rules without highlander rules solve the puzzle avoids SAT uniqueness checks (the
+    // bottleneck on large boards)
+    wasmCheck('EASY', EASY_GROUPS, false, undefined, {
+      key: 'EASY-sound',
+      groups: withoutHighlander(EASY_GROUPS),
+      only: true,
+    }),
   );
 
   public static readonly MEDIUM = new CanSolveDifficulty(
@@ -161,7 +177,13 @@ export default class CanSolveDifficulty extends EnumerationValue {
 
       return simpleRegionIsSolved(state);
     },
-    wasmCheck('MEDIUM', MEDIUM_GROUPS, false, { key: 'EASY', groups: EASY_GROUPS }),
+    wasmCheck(
+      'MEDIUM',
+      MEDIUM_GROUPS,
+      false,
+      { key: 'EASY', groups: EASY_GROUPS },
+      { key: 'MEDIUM-sound', groups: withoutHighlander(MEDIUM_GROUPS), only: true },
+    ),
   );
 
   public static readonly HARD = new CanSolveDifficulty(
@@ -218,6 +240,7 @@ export default class CanSolveDifficulty extends EnumerationValue {
       ],
       true,
       { key: 'MEDIUM', groups: MEDIUM_GROUPS },
+      { key: 'MEDIUM-sound', groups: withoutHighlander(MEDIUM_GROUPS), only: false },
     ),
   );
 

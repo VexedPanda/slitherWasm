@@ -64,6 +64,7 @@ type CoreExports = {
     topologyHandle: number,
     rulesHandle: number,
     easierRulesHandle: number,
+    soundRulesHandle: number,
     check: number,
     seedLow: number,
     seedHigh: number,
@@ -76,6 +77,7 @@ type CoreExports = {
     topologyHandle: number,
     rulesHandle: number,
     easierRulesHandle: number,
+    soundRulesHandle: number,
     steps: number,
   ) => number;
   gen_result: (handle: number) => void;
@@ -380,6 +382,10 @@ export type WasmDifficultyRules = {
   hard: boolean;
   // An easier difficulty's EASY/MEDIUM-style rules (a subset of these), tried first since they're cheaper
   easier?: { key: string; getRules: () => CompiledRules };
+  // Rules that don't assume uniqueness (no highlander rules), so a puzzle they solve is unique without a SAT check.
+  // `impliesDifficulty`: they're a subset of the difficulty's rules. `only`: minimization only removes values while they
+  // still solve the puzzle (otherwise it falls back to the difficulty check and SAT).
+  sound?: { key: string; getRules: () => CompiledRules; impliesDifficulty: boolean; only: boolean };
 };
 
 export type WasmGenerationEvent =
@@ -402,8 +408,18 @@ export const wasmGenerate = async (
 ): Promise<{ faceValues: (number | null)[]; solutionEdges: TEdge[] } | null> => {
   const core = getCore();
   const boardHandle = getCoreBoard(board).handle;
-  const rulesHandle = rules ? getRulesHandle(board, rules.key, rules.getRules) : NONE;
-  const easierRulesHandle = rules?.easier ? getRulesHandle(board, rules.easier.key, rules.easier.getRules) : NONE;
+  // With sound-only rules that imply the difficulty, they're the whole check (see generator.rs), so the (large) main and
+  // easier rules aren't compiled
+  const soundOnly = !!rules?.sound && rules.sound.only && rules.sound.impliesDifficulty;
+  const rulesHandle = rules && !soundOnly ? getRulesHandle(board, rules.key, rules.getRules) : NONE;
+  const easierRulesHandle =
+    rules?.easier && !soundOnly ? getRulesHandle(board, rules.easier.key, rules.easier.getRules) : NONE;
+  const soundRulesHandle =
+    rules?.sound ?
+      getRulesHandle(board, rules.sound.key, rules.sound.getRules) |
+      (rules.sound.impliesDifficulty ? 0x80000000 : 0) |
+      (rules.sound.only ? 0x40000000 : 0)
+    : NONE;
   const topologyHandle = rules?.hard ? getTopologyHandle(board) : NONE;
   const check =
     !rules ? 0
@@ -424,6 +440,7 @@ export const wasmGenerate = async (
       topologyHandle,
       rulesHandle,
       easierRulesHandle,
+      soundRulesHandle >>> 0,
       check,
       seed[0],
       seed[1],
@@ -435,7 +452,15 @@ export const wasmGenerate = async (
   try {
     let lastYield = performance.now();
     while (true) {
-      const status = core.gen_step(handle, boardHandle, topologyHandle, rulesHandle, easierRulesHandle, 1);
+      const status = core.gen_step(
+        handle,
+        boardHandle,
+        topologyHandle,
+        rulesHandle,
+        easierRulesHandle,
+        soundRulesHandle >>> 0,
+        1,
+      );
       const output = new Uint32Array(core.memory.buffer, core.output_pointer(), core.output_length()).slice();
       for (let i = 0; i < output.length; i += 3) {
         const type = output[i];
