@@ -5,3 +5,5 @@ public/
 README.md
 LICENSE
 .prettierrc.js
+test/node/.out/
+wasm/target/
