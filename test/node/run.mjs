@@ -18,7 +18,7 @@ await build({
 });
 const result = spawnSync(
   process.execPath,
-  ['--no-warnings', '--import', resolve(import.meta.dirname, 'stubs.mjs'), output, ...args],
+  ['--no-warnings', '--expose-gc', '--import', resolve(import.meta.dirname, 'stubs.mjs'), output, ...args],
   { stdio: 'inherit', cwd: resolve(import.meta.dirname, '../..') },
 );
 process.exit(result.status ?? 1);

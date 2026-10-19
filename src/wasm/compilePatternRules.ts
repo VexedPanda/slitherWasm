@@ -12,16 +12,20 @@
  * Atoms are numbered: edge e black = 2e, edge e red = 2e + 1, then for sector (half-edge) h: not zero = 2E + 3h, not
  * one = 2E + 3h + 1, not two = 2E + 3h + 2. "Only one" is "not zero" and "not two".
  *
- * Color relations are (faceA, faceB, kind) with kind 0 for same and 1 for opposite, where face F (the number of faces)
- * is the outside.
+ * Color relations are (faceA, faceB, kind) with faceA <= faceB, and kind 0 for same and 1 for opposite, where face F (the
+ * number of faces) is the outside.
  *
  * Each clause is encoded as: faceConditionCount, (face, value)..., faceCount, face..., bodyCount, atom..., headCount,
- * atom..., colorConditionCount, (faceA, faceB, kind)..., colorOutputCount, (faceA, faceB, kind)..., patternFaceCount.
- * A face value of 0xff means "no value".
+ * atom..., colorConditionCount, (faceA, faceB, kind)..., colorOutputCount, (faceA, faceB, kind)..., patternFaceCount,
+ * with each list sorted (so equal conditions are equal sequences). A face value of 0xff means "no value". Clauses with
+ * the same conditions (e.g. from a symmetric rule's equivalent embeddings) are merged by the core (cansolve.rs).
+ *
+ * Large boards have hundreds of thousands of clauses, so (for memory, e.g. on phones) they're written straight into a
+ * typed array, and each pattern board's embeddings are only kept while its rules are compiled.
  */
 import { TBoard } from '../model/board/core/TBoard.ts';
 import { BinaryMixedRuleGroup } from '../model/pattern/collection/BinaryMixedRuleGroup.ts';
-import { getEmbeddings } from '../model/pattern/embedding/getEmbeddings.ts';
+import { computeEmbeddings } from '../model/pattern/embedding/computeEmbeddings.ts';
 import { BlackEdgeFeature } from '../model/pattern/feature/BlackEdgeFeature.ts';
 import { getBoardFeaturePositions } from '../model/pattern/feature/BoardFeatureData.ts';
 import { FaceFeature } from '../model/pattern/feature/FaceFeature.ts';
@@ -33,6 +37,7 @@ import { SectorOnlyOneFeature } from '../model/pattern/feature/SectorOnlyOneFeat
 import { TEmbeddableFeature } from '../model/pattern/feature/TEmbeddableFeature.ts';
 import { getBinaryFeatureMapping } from '../model/pattern/generation/BinaryFeatureMapping.ts';
 import { BoardPatternBoard } from '../model/pattern/pattern-board/BoardPatternBoard.ts';
+import { TPatternBoard } from '../model/pattern/pattern-board/TPatternBoard.ts';
 
 export const NO_FACE_VALUE = 0xff;
 
@@ -42,7 +47,103 @@ export type CompiledRules = {
   clauseCount: number;
 };
 
-export type RuleGroupLimit = { group: BinaryMixedRuleGroup; size: number };
+// The first `size` rules of a group, optionally without its highlander rules (which assume the puzzle is unique)
+export type RuleGroupLimit = { group: BinaryMixedRuleGroup; size: number; withoutHighlander?: boolean };
+
+// Face color dual: the main primary face, then (pattern face, isSecondary) pairs
+type Dual = { main: number; others: [number, boolean][] };
+
+type ParsedRule = {
+  patternBoard: TPatternBoard;
+  inputFeatures: TEmbeddableFeature[];
+  outputFeatures: TEmbeddableFeature[];
+  inputDuals: Dual[];
+  outputDuals: Dual[];
+};
+
+// A growable Uint32Array
+class Output {
+  public data = new Uint32Array(1 << 16);
+  public length = 0;
+
+  public push(value: number): void {
+    if (this.length === this.data.length) {
+      const data = new Uint32Array(this.data.length * 2);
+      data.set(this.data);
+      this.data = data;
+    }
+    this.data[this.length++] = value;
+  }
+
+  // The number of tuples, then the flat values
+  public pushTuples(flat: number[], tupleSize: number): void {
+    this.push(flat.length / tupleSize);
+    for (const value of flat) {
+      this.push(value);
+    }
+  }
+}
+
+const parseRule = (group: BinaryMixedRuleGroup, ruleIndex: number): ParsedRule => {
+  const collection = group.collection;
+  const patternBoard = collection.getRulePatternBoard(ruleIndex);
+  const mapping = getBinaryFeatureMapping(patternBoard);
+  const bytes = collection.getRuleBytes(ruleIndex, false);
+
+  // Input and output feature bytes (each section ends with 0xff; face indices in face color dual sections are below
+  // 0xfe)
+  const parse = (sectionBytes: number[]) => {
+    const features: TEmbeddableFeature[] = [];
+    const duals: Dual[] = [];
+    for (let i = 0; i < sectionBytes.length; i++) {
+      const byte = sectionBytes[i];
+      if (byte === 0xfe) {
+        const dual: Dual = { main: sectionBytes[++i], others: [] };
+        while (i + 1 < sectionBytes.length && sectionBytes[i + 1] !== 0xfe) {
+          const next = sectionBytes[++i];
+          dual.others.push([next & 0x7f, (next & 0x80) !== 0]);
+        }
+        duals.push(dual);
+      } else {
+        features.push(mapping.featureArray[byte]);
+      }
+    }
+    return { features, duals };
+  };
+  const separator = bytes.indexOf(0xff);
+  const input = parse(bytes.slice(0, separator));
+  const output = parse(bytes.slice(separator + 1, bytes.length - 1));
+  return {
+    patternBoard,
+    inputFeatures: input.features,
+    outputFeatures: output.features,
+    inputDuals: input.duals,
+    outputDuals: output.duals,
+  };
+};
+
+const sortedUnique = (values: number[]): number[] => [...new Set(values)].sort((a, b) => a - b);
+
+// Flat tuples of the given size, deduplicated and sorted
+const sortedTuples = (flat: number[], size: number): number[] => {
+  const tuples: number[][] = [];
+  for (let i = 0; i < flat.length; i += size) {
+    const tuple = flat.slice(i, i + size);
+    if (!tuples.some((other) => other.every((value, j) => value === tuple[j]))) {
+      tuples.push(tuple);
+    }
+  }
+  return tuples
+    .sort((a, b) => {
+      for (let i = 0; i < size; i++) {
+        if (a[i] !== b[i]) {
+          return a[i] - b[i];
+        }
+      }
+      return 0;
+    })
+    .flat();
+};
 
 export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): CompiledRules => {
   const boardPatternBoard = BoardPatternBoard.get(board);
@@ -61,77 +162,65 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
   });
   const patternSectorToHalfEdge = positions.sectors.map((sector) => halfEdgeIndices.get(sector)!);
 
-  const clauses = new Map<
-    string,
-    {
-      faceConditions: number[];
-      faces: number[];
-      body: number[];
-      head: Set<number>;
-      colorConditions: number[];
-      colorOutputs: Set<string>;
-      patternFaceCount: number;
-    }
-  >();
-
-  for (const { group, size } of groups) {
-    const collection = group.collection;
+  // Rules grouped by pattern board, so each pattern board's embeddings are computed once (and then released)
+  const rulesByPatternBoard = new Map<TPatternBoard, ParsedRule[]>();
+  for (const { group, size, withoutHighlander } of groups) {
     for (let ruleIndex = 0; ruleIndex < size; ruleIndex++) {
-      const patternBoard = collection.getRulePatternBoard(ruleIndex);
-      const mapping = getBinaryFeatureMapping(patternBoard);
-      const bytes = collection.getRuleBytes(ruleIndex, false);
+      if (withoutHighlander && group.isRuleIndexHighlander(ruleIndex)) {
+        continue;
+      }
+      const rule = parseRule(group, ruleIndex);
+      let rules = rulesByPatternBoard.get(rule.patternBoard);
+      if (!rules) {
+        rules = [];
+        rulesByPatternBoard.set(rule.patternBoard, rules);
+      }
+      rules.push(rule);
+    }
+  }
 
-      // Split into input and output feature bytes (each section ends with 0xff; face indices in face color dual
-      // sections are below 0xfe)
-      const separator = bytes.indexOf(0xff);
-      const parse = (sectionBytes: number[]) => {
-        const features: TEmbeddableFeature[] = [];
-        // Face color duals: [main primary face, then (pattern face, isSecondary) pairs]
-        const duals: { main: number; others: [number, boolean][] }[] = [];
-        for (let i = 0; i < sectionBytes.length; i++) {
-          const byte = sectionBytes[i];
-          if (byte === 0xfe) {
-            const dual = { main: sectionBytes[++i], others: [] as [number, boolean][] };
-            while (i + 1 < sectionBytes.length && sectionBytes[i + 1] !== 0xfe) {
-              const next = sectionBytes[++i];
-              dual.others.push([next & 0x7f, (next & 0x80) !== 0]);
-            }
-            duals.push(dual);
-          } else {
-            features.push(mapping.featureArray[byte]);
+  const output = new Output();
+  let clauseCount = 0;
+
+  for (const [patternBoard, rules] of rulesByPatternBoard) {
+    for (const embedding of computeEmbeddings(patternBoard, boardPatternBoard)) {
+      const sectorAtom = (patternSectorIndex: number, flag: number) =>
+        2 * numEdges + 3 * patternSectorToHalfEdge[embedding.mappedSectorIndices[patternSectorIndex]] + flag;
+
+      // A rule pattern face's board face (the outside for none)
+      const mapFace = (patternFaceIndex: number) => {
+        const face = patternFaceToFace[embedding.mappedFaceIndices[patternBoard.faces[patternFaceIndex].index]];
+        return face === -1 ? outside : face;
+      };
+
+      // The faces the rules cover (including their exit faces), for the separate face check
+      const faces: number[] = [];
+      for (const patternFace of patternBoard.faces) {
+        const face = patternFaceToFace[embedding.mappedFaceIndices[patternFace.index]];
+        if (face !== -1) {
+          faces.push(face);
+        }
+      }
+      const sortedFaces = sortedUnique(faces);
+
+      // Face color relations, normalized to (smaller face, larger face, kind)
+      const relations = (duals: Dual[]) => {
+        const result: number[] = [];
+        for (const dual of duals) {
+          const main = mapFace(dual.main);
+          for (const [patternFaceIndex, isSecondary] of dual.others) {
+            const other = mapFace(patternFaceIndex);
+            result.push(Math.min(main, other), Math.max(main, other), isSecondary ? 1 : 0);
           }
         }
-        return { features, duals };
+        return sortedTuples(result, 3);
       };
-      const input = parse(bytes.slice(0, separator));
-      const output = parse(bytes.slice(separator + 1, bytes.length - 1));
 
-      for (const embedding of getEmbeddings(patternBoard, boardPatternBoard)) {
+      for (const rule of rules) {
         const faceConditions: number[] = [];
         const body: number[] = [];
         const head: number[] = [];
         let possible = true;
-
-        const sectorAtom = (patternSectorIndex: number, flag: number) =>
-          2 * numEdges + 3 * patternSectorToHalfEdge[embedding.mappedSectorIndices[patternSectorIndex]] + flag;
-
-        // A rule pattern face's board face (the outside for none)
-        const mapFace = (patternFaceIndex: number) => {
-          const face = patternFaceToFace[embedding.mappedFaceIndices[patternBoard.faces[patternFaceIndex].index]];
-          return face === -1 ? outside : face;
-        };
-        const addColorRelations = (duals: { main: number; others: [number, boolean][] }[], relations: number[]) => {
-          for (const dual of duals) {
-            const main = mapFace(dual.main);
-            for (const [patternFaceIndex, isSecondary] of dual.others) {
-              relations.push(main, mapFace(patternFaceIndex), isSecondary ? 1 : 0);
-            }
-          }
-        };
-        const colorConditions: number[] = [];
-        const colorOutputs: number[] = [];
-        addColorRelations(input.duals, colorConditions);
-        addColorRelations(output.duals, colorOutputs);
 
         const addAtoms = (feature: TEmbeddableFeature, atoms: number[], isInput: boolean) => {
           if (feature instanceof FaceFeature) {
@@ -171,108 +260,27 @@ export const compilePatternRules = (board: TBoard, groups: RuleGroupLimit[]): Co
           }
         };
 
-        for (const feature of input.features) {
+        for (const feature of rule.inputFeatures) {
           addAtoms(feature, body, true);
         }
-        for (const feature of output.features) {
+        for (const feature of rule.outputFeatures) {
           addAtoms(feature, head, false);
         }
         if (!possible) {
           continue;
         }
 
-        // The faces the rule covers (including its exit faces), for the separate face check
-        const faces = new Set<number>();
-        for (const patternFace of patternBoard.faces) {
-          const face = patternFaceToFace[embedding.mappedFaceIndices[patternFace.index]];
-          if (face !== -1) {
-            faces.add(face);
-          }
-        }
-
-        // Clauses with the same conditions (e.g. from a symmetric rule's equivalent embeddings) are merged, with their
-        // outputs combined
-        const sortedFaceConditions = sortedTuples(faceConditions, 2);
-        const sortedFaces = [...faces].sort((a, b) => a - b);
-        const sortedBody = [...new Set(body)].sort((a, b) => a - b);
-        const sortedColorConditions = sortedTuples(normalizedRelations(colorConditions), 3);
-        const key = [
-          sortedFaceConditions.join(','),
-          sortedFaces.join(','),
-          sortedBody.join(','),
-          sortedColorConditions.join(','),
-          patternBoard.faces.length,
-        ].join('|');
-        let clause = clauses.get(key);
-        if (!clause) {
-          clause = {
-            faceConditions: sortedFaceConditions,
-            faces: sortedFaces,
-            body: sortedBody,
-            head: new Set(),
-            colorConditions: sortedColorConditions,
-            colorOutputs: new Set(),
-            patternFaceCount: patternBoard.faces.length,
-          };
-          clauses.set(key, clause);
-        }
-        for (const atom of head) {
-          clause.head.add(atom);
-        }
-        const outputs = normalizedRelations(colorOutputs);
-        for (let i = 0; i < outputs.length; i += 3) {
-          clause.colorOutputs.add(`${outputs[i]},${outputs[i + 1]},${outputs[i + 2]}`);
-        }
+        output.pushTuples(sortedTuples(faceConditions, 2), 2);
+        output.pushTuples(sortedFaces, 1);
+        output.pushTuples(sortedUnique(body), 1);
+        output.pushTuples(sortedUnique(head), 1);
+        output.pushTuples(relations(rule.inputDuals), 3);
+        output.pushTuples(relations(rule.outputDuals), 3);
+        output.push(patternBoard.faces.length);
+        clauseCount++;
       }
     }
   }
 
-  const data: number[] = [];
-  for (const clause of clauses.values()) {
-    const colorOutputs = [...clause.colorOutputs].flatMap((relation) => relation.split(',').map(Number));
-    pushAll(data, [clause.faceConditions.length / 2, ...clause.faceConditions]);
-    pushAll(data, [clause.faces.length, ...clause.faces]);
-    pushAll(data, [clause.body.length, ...clause.body]);
-    pushAll(data, [clause.head.size, ...clause.head]);
-    pushAll(data, [clause.colorConditions.length / 3, ...clause.colorConditions]);
-    pushAll(data, [colorOutputs.length / 3, ...colorOutputs]);
-    data.push(clause.patternFaceCount);
-  }
-
-  return { numSectors: board.halfEdges.length, clauses: new Uint32Array(data), clauseCount: clauses.size };
-};
-
-// (push(...values) can overflow the stack for long arrays)
-const pushAll = (target: number[], values: number[]) => {
-  for (const value of values) {
-    target.push(value);
-  }
-};
-
-// Flat tuples of the given size, deduplicated and sorted
-const sortedTuples = (flat: number[], size: number): number[] => {
-  const tuples: number[][] = [];
-  for (let i = 0; i < flat.length; i += size) {
-    tuples.push(flat.slice(i, i + size));
-  }
-  const unique = new Map(tuples.map((tuple) => [tuple.join(','), tuple]));
-  return [...unique.values()]
-    .sort((a, b) => {
-      for (let i = 0; i < size; i++) {
-        if (a[i] !== b[i]) {
-          return a[i] - b[i];
-        }
-      }
-      return 0;
-    })
-    .flat();
-};
-
-// Color relations (faceA, faceB, kind) with faceA <= faceB
-const normalizedRelations = (flat: number[]): number[] => {
-  const result: number[] = [];
-  for (let i = 0; i < flat.length; i += 3) {
-    result.push(Math.min(flat[i], flat[i + 1]), Math.max(flat[i], flat[i + 1]), flat[i + 2]);
-  }
-  return result;
+  return { numSectors: board.halfEdges.length, clauses: output.data.slice(0, output.length), clauseCount };
 };

@@ -272,6 +272,7 @@ fn with_generator_context<T>(
     topology_handle: u32,
     rules_handle: u32,
     easier_rules_handle: u32,
+    sound_rules_handle: u32,
     callback: impl FnOnce(&solver::Board, Option<&topology::Topology>, generator::Rules) -> T,
 ) -> T {
     BOARDS.with(|boards| {
@@ -285,6 +286,11 @@ fn with_generator_context<T>(
                 let rules = generator::Rules {
                     main: sets.get(rules_handle as usize).and_then(|r| r.as_ref()),
                     easier: sets.get(easier_rules_handle as usize).and_then(|r| r.as_ref()),
+                    sound: sets
+                        .get((sound_rules_handle & 0x3fff_ffff) as usize)
+                        .and_then(|r| r.as_ref()),
+                    sound_implies_difficulty: sound_rules_handle & 0x8000_0000 != 0 && sound_rules_handle != u32::MAX,
+                    sound_only: sound_rules_handle & 0x4000_0000 != 0 && sound_rules_handle != u32::MAX,
                 };
                 callback(board, topology, rules)
             })
@@ -306,6 +312,7 @@ pub unsafe extern "C" fn gen_create(
     topology_handle: u32,
     rules_handle: u32,
     easier_rules_handle: u32,
+    sound_rules_handle: u32,
     check: u32,
     seed_low: u32,
     seed_high: u32,
@@ -328,6 +335,7 @@ pub unsafe extern "C" fn gen_create(
         topology_handle,
         rules_handle,
         easier_rules_handle,
+        sound_rules_handle,
         |board, topology, rules| generator::Generator::new(board, topology, rules, check, seed, resume),
     );
     GENERATORS.with(|generators| {
@@ -351,6 +359,7 @@ pub extern "C" fn gen_step(
     topology_handle: u32,
     rules_handle: u32,
     easier_rules_handle: u32,
+    sound_rules_handle: u32,
     steps: u32,
 ) -> u32 {
     GENERATORS.with(|generators| {
@@ -362,6 +371,7 @@ pub extern "C" fn gen_step(
             topology_handle,
             rules_handle,
             easier_rules_handle,
+            sound_rules_handle,
             |board, topology, rules| {
                 for _ in 0..steps.max(1) {
                     status = generator.step(board, topology, rules);
