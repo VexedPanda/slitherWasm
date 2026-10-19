@@ -14,6 +14,33 @@ import { deserializeSolvedPuzzle } from '../model/generator/deserializeSolvedPuz
 
 let generationAdditiveConstrainedWorker: Worker | null = null;
 
+// The worker is terminated once it has been idle for this long: its WebAssembly memory only ever grows (to hundreds of
+// MB for large boards), and keeping it while the player pans and zooms can get the page killed on phones
+const IDLE_TERMINATE_DELAY = 3000;
+let activeRequests = 0;
+let idleTimeout: ReturnType<typeof setTimeout> | null = null;
+
+const acquireWorker = (): Worker => {
+  if (idleTimeout !== null) {
+    clearTimeout(idleTimeout);
+    idleTimeout = null;
+  }
+  activeRequests++;
+  return getGenerationAdditiveConstrainedWorker();
+};
+
+const releaseWorker = () => {
+  activeRequests--;
+  if (activeRequests === 0) {
+    idleTimeout = setTimeout(() => {
+      idleTimeout = null;
+      generationAdditiveConstrainedWorker?.terminate();
+      generationAdditiveConstrainedWorker = null;
+      generationAdditiveConstrainedWorkerLoadedProperty.value = false;
+    }, IDLE_TERMINATE_DELAY);
+  }
+};
+
 export const generationAdditiveConstrainedWorkerLoadedProperty = new TinyProperty(false);
 
 export const getGenerationAdditiveConstrainedWorker = (): Worker => {
@@ -30,8 +57,9 @@ export const getGenerationAdditiveConstrainedWorker = (): Worker => {
   return generationAdditiveConstrainedWorker!;
 };
 
-// Load on startup (for now)
-getGenerationAdditiveConstrainedWorker();
+// Load on startup, so the first generation doesn't wait for it (it's terminated if nothing uses it soon)
+acquireWorker();
+releaseWorker();
 
 export const generateAdditiveConstrainedWithWorker = async (
   board: TBoard,
@@ -44,7 +72,7 @@ export const generateAdditiveConstrainedWithWorker = async (
   resumeProgress: GenerationProgressEvent[] = [],
 ): Promise<TSolvedPuzzle<TStructure, TCompleteData> | null> => {
   return new Promise((resolve, reject) => {
-    const worker = getGenerationAdditiveConstrainedWorker();
+    const worker = acquireWorker();
 
     const id = Math.random();
 
@@ -56,9 +84,14 @@ export const generateAdditiveConstrainedWithWorker = async (
       resumeProgress: resumeProgress,
     });
 
+    let cleanedUp = false;
     const cleanup = () => {
-      interruptedProperty.unlink(interruptedListener);
-      worker.removeEventListener('message', generationListener);
+      if (!cleanedUp) {
+        cleanedUp = true;
+        interruptedProperty.unlink(interruptedListener);
+        worker.removeEventListener('message', generationListener);
+        releaseWorker();
+      }
     };
 
     const interruptedListener = (interrupted: boolean) => {
