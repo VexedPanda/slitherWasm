@@ -1,6 +1,7 @@
 import { TBoard } from '../../board/core/TBoard.ts';
 import { TSerializedHalfEdge } from '../../board/core/TSerializedHalfEdge.ts';
 import { deserializeHalfEdge } from '../../board/core/deserializeHalfEdge.ts';
+import { ChunkedStore } from '../core/ChunkedStore.ts';
 import { TDelta } from '../core/TDelta.ts';
 import { TState } from '../core/TState.ts';
 import { GeneralSectorStateDelta } from './GeneralSectorStateDelta.ts';
@@ -17,15 +18,15 @@ export class GeneralSectorStateData implements TState<TSectorStateData> {
     [sector: TSector, state: SectorState, oldState: SectorState]
   >();
 
-  public readonly sectorStateMap: Map<TSector, SectorState> = new Map();
+  public readonly sectorStateMap: ChunkedStore<TSector, SectorState>;
 
   public constructor(
     public readonly board: TBoard,
     getInitialSectorState: (sector: TSector) => SectorState = () => SectorState.ANY,
+    // (shared with the state this is cloned from, see ChunkedStore)
+    sectorStateMap?: ChunkedStore<TSector, SectorState>,
   ) {
-    board.halfEdges.forEach((sector) => {
-      this.sectorStateMap.set(sector, getInitialSectorState(sector));
-    });
+    this.sectorStateMap = sectorStateMap ?? ChunkedStore.create(board.halfEdges, getInitialSectorState);
   }
 
   public getSectorState(sector: TSector): SectorState {
@@ -47,7 +48,11 @@ export class GeneralSectorStateData implements TState<TSectorStateData> {
   }
 
   public clone(): GeneralSectorStateData {
-    return new GeneralSectorStateData(this.board, (sector) => this.getSectorState(sector));
+    return new GeneralSectorStateData(
+      this.board,
+      (element) => this.getSectorState(element),
+      this.sectorStateMap.clone(),
+    );
   }
 
   public createDelta(): TDelta<TSectorStateData> {

@@ -2,6 +2,7 @@ import { TBoard } from '../../board/core/TBoard.ts';
 import { TEdge } from '../../board/core/TEdge.ts';
 import { TSerializedEdge } from '../../board/core/TSerializedEdge.ts';
 import { deserializeEdge } from '../../board/core/deserializeEdge.ts';
+import { ChunkedStore } from '../core/ChunkedStore.ts';
 import { TDelta } from '../core/TDelta.ts';
 import { TState } from '../core/TState.ts';
 import EdgeState from './EdgeState.ts';
@@ -16,15 +17,15 @@ import assert, { assertEnabled } from '../../../workarounds/assert.ts';
 export class GeneralEdgeStateData implements TState<TEdgeStateData> {
   public readonly edgeStateChangedEmitter = new TinyEmitter<[edge: TEdge, state: EdgeState, oldState: EdgeState]>();
 
-  public readonly edgeStateMap: Map<TEdge, EdgeState> = new Map();
+  public readonly edgeStateMap: ChunkedStore<TEdge, EdgeState>;
 
   public constructor(
     public readonly board: TBoard,
     getInitialEdgeState: (edge: TEdge) => EdgeState,
+    // (shared with the state this is cloned from, see ChunkedStore)
+    edgeStateMap?: ChunkedStore<TEdge, EdgeState>,
   ) {
-    board.edges.forEach((edge) => {
-      this.edgeStateMap.set(edge, getInitialEdgeState(edge));
-    });
+    this.edgeStateMap = edgeStateMap ?? ChunkedStore.create(board.edges, getInitialEdgeState);
   }
 
   public getEdgeState(edge: TEdge): EdgeState {
@@ -46,7 +47,7 @@ export class GeneralEdgeStateData implements TState<TEdgeStateData> {
   }
 
   public clone(): GeneralEdgeStateData {
-    return new GeneralEdgeStateData(this.board, (edge) => this.getEdgeState(edge));
+    return new GeneralEdgeStateData(this.board, (element) => this.getEdgeState(element), this.edgeStateMap.clone());
   }
 
   public createDelta(): TDelta<TEdgeStateData> {
