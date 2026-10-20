@@ -2,6 +2,7 @@ import { TBoard } from '../../board/core/TBoard.ts';
 import { TSerializedVertex } from '../../board/core/TSerializedVertex.ts';
 import { TVertex } from '../../board/core/TVertex.ts';
 import { deserializeVertex } from '../../board/core/deserializeVertex.ts';
+import { ChunkedStore } from '../core/ChunkedStore.ts';
 import { TDelta } from '../core/TDelta.ts';
 import { TState } from '../core/TState.ts';
 import { GeneralVertexStateDelta } from './GeneralVertexStateDelta.ts';
@@ -17,15 +18,15 @@ export class GeneralVertexStateData implements TState<TVertexStateData> {
     [vertex: TVertex, state: VertexState, oldState: VertexState]
   >();
 
-  public readonly vertexStateMap: Map<TVertex, VertexState> = new Map();
+  public readonly vertexStateMap: ChunkedStore<TVertex, VertexState>;
 
   public constructor(
     public readonly board: TBoard,
     getInitialVertexState: (vertex: TVertex) => VertexState = VertexState.any,
+    // (shared with the state this is cloned from, see ChunkedStore)
+    vertexStateMap?: ChunkedStore<TVertex, VertexState>,
   ) {
-    board.vertices.forEach((vertex) => {
-      this.vertexStateMap.set(vertex, getInitialVertexState(vertex));
-    });
+    this.vertexStateMap = vertexStateMap ?? ChunkedStore.create(board.vertices, getInitialVertexState);
   }
 
   public getVertexState(vertex: TVertex): VertexState {
@@ -47,7 +48,11 @@ export class GeneralVertexStateData implements TState<TVertexStateData> {
   }
 
   public clone(): GeneralVertexStateData {
-    return new GeneralVertexStateData(this.board, (vertex) => this.getVertexState(vertex));
+    return new GeneralVertexStateData(
+      this.board,
+      (element) => this.getVertexState(element),
+      this.vertexStateMap.clone(),
+    );
   }
 
   public createDelta(): TDelta<TVertexStateData> {

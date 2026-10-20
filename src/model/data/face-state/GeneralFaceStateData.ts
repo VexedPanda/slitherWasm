@@ -2,6 +2,7 @@ import { TBoard } from '../../board/core/TBoard.ts';
 import { TFace } from '../../board/core/TFace.ts';
 import { TSerializedFace } from '../../board/core/TSerializedFace.ts';
 import { deserializeFace } from '../../board/core/deserializeFace.ts';
+import { ChunkedStore } from '../core/ChunkedStore.ts';
 import { TDelta } from '../core/TDelta.ts';
 import { TState } from '../core/TState.ts';
 import { FaceState, TSerializedFaceState } from './FaceState.ts';
@@ -15,15 +16,15 @@ import assert, { assertEnabled } from '../../../workarounds/assert.ts';
 export class GeneralFaceStateData implements TState<TFaceStateData> {
   public readonly faceStateChangedEmitter = new TinyEmitter<[face: TFace, state: FaceState, oldState: FaceState]>();
 
-  public readonly faceStateMap: Map<TFace, FaceState> = new Map();
+  public readonly faceStateMap: ChunkedStore<TFace, FaceState>;
 
   public constructor(
     public readonly board: TBoard,
     getInitialFaceState: (face: TFace) => FaceState,
+    // (shared with the state this is cloned from, see ChunkedStore)
+    faceStateMap?: ChunkedStore<TFace, FaceState>,
   ) {
-    board.faces.forEach((face) => {
-      this.faceStateMap.set(face, getInitialFaceState(face));
-    });
+    this.faceStateMap = faceStateMap ?? ChunkedStore.create(board.faces, getInitialFaceState);
   }
 
   public getFaceState(face: TFace): FaceState {
@@ -45,7 +46,7 @@ export class GeneralFaceStateData implements TState<TFaceStateData> {
   }
 
   public clone(): GeneralFaceStateData {
-    return new GeneralFaceStateData(this.board, (face) => this.getFaceState(face));
+    return new GeneralFaceStateData(this.board, (element) => this.getFaceState(element), this.faceStateMap.clone());
   }
 
   public createDelta(): TDelta<TFaceStateData> {
