@@ -41,7 +41,7 @@ const LOOP_MIN_INSIDE_DIVISOR: usize = 3;
 // Random loops grow towards faces more than this many faces away from a face the loop touches (far from the loop, faces
 // need few values, leaving large areas without values)
 const LOOP_MAX_GAP: u32 = 1;
-// Faces per minimization cluster (see Generator::start_minimize)
+// Faces per minimization cluster (see Generator::cluster_order)
 const MINIMIZE_CLUSTER_SIZE: usize = 32;
 const WITNESS_ROUNDS: u64 = 256;
 // The most values added at once from a witness solution
@@ -119,7 +119,7 @@ pub struct Generator {
     counter: Option<SolutionCounter>,
     // Values to try removing at once while minimizing
     block: usize,
-    // Loop-first minimization goes through clusters of faces (ending at these positions), checking removals from
+    // Loop-first minimization goes through clusters of nearby faces (ending at these positions), checking removals from
     // a checkpoint of the deduction without the current cluster's values (see cansolve::Checkpoint)
     cluster_ends: Vec<usize>,
     checkpoint: Option<(usize, cansolve::Checkpoint)>,
@@ -214,7 +214,7 @@ impl Generator {
                     .filter(|&f| minimized[f as usize].is_none())
                     .collect();
                 self.shuffle(&mut order);
-                self.start_minimize(order);
+                self.start_minimize(board, order);
                 return;
             }
             // Couldn't resume
@@ -735,11 +735,11 @@ impl Generator {
         }
         let mut order: Vec<u32> = (0..board.num_faces as u32).collect();
         self.shuffle(&mut order);
-        self.start_minimize(order);
+        self.start_minimize(board, order);
         Status::Running
     }
 
-    fn start_minimize(&mut self, order: Vec<u32>) {
+    fn start_minimize(&mut self, board: &Board, mut order: Vec<u32>) {
         self.minimize_start_values = self.face_values.clone();
         self.kept.fill(false);
         self.uniqueness = None;
@@ -747,13 +747,56 @@ impl Generator {
         self.checkpoint = None;
         self.cluster_ends.clear();
         if self.loop_first {
-            // Consecutive faces in the random order (spread across the board: clusters of nearby faces would each be
-            // emptied while the faces around them still had values, leaving large areas without values)
-            self.cluster_ends
-                .extend((MINIMIZE_CLUSTER_SIZE..order.len()).step_by(MINIMIZE_CLUSTER_SIZE));
+            order = self.cluster_order(board, &order);
+        } else {
+            self.cluster_ends.push(order.len());
         }
-        self.cluster_ends.push(order.len());
         self.phase = Phase::Minimize { order, position: 0 };
+    }
+
+    // The faces grouped into clusters of nearby faces (breadth-first from each one in the order not yet in a cluster),
+    // each shuffled, setting cluster_ends
+    fn cluster_order(&mut self, board: &Board, order: &[u32]) -> Vec<u32> {
+        let mut wanted = vec![false; board.num_faces];
+        for &f in order {
+            wanted[f as usize] = true;
+        }
+        let mut seen = vec![false; board.num_faces];
+        let mut result = Vec::with_capacity(order.len());
+        for &start in order {
+            if !wanted[start as usize] {
+                continue;
+            }
+            let cluster_start = result.len();
+            let mut queue = std::collections::VecDeque::from([start]);
+            let mut visited = vec![start];
+            seen[start as usize] = true;
+            while let Some(f) = queue.pop_front() {
+                if wanted[f as usize] {
+                    wanted[f as usize] = false;
+                    result.push(f);
+                    if result.len() - cluster_start >= MINIMIZE_CLUSTER_SIZE {
+                        break;
+                    }
+                }
+                for &e in board.face_edges_of(f as usize) {
+                    for &g in &board.edge_faces[e as usize] {
+                        if g != u32::MAX && !seen[g as usize] {
+                            seen[g as usize] = true;
+                            visited.push(g);
+                            queue.push_back(g);
+                        }
+                    }
+                }
+            }
+            for f in visited {
+                seen[f as usize] = false;
+            }
+            let end = result.len();
+            self.shuffle(&mut result[cluster_start..end]);
+            self.cluster_ends.push(end);
+        }
+        result
     }
 
     // Removes values in blocks: a block whose values can all be removed (still unique, and solvable at the difficulty) is
