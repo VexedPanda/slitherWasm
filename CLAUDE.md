@@ -17,7 +17,7 @@
   Always pass `--repo VexedPanda/slitherWasm` to `gh pr` commands; without it `gh` may pick the wrong repository.
 - **Branches and PRs:** use `claude/*` branches. Always open a PR for finished work and enable auto-merge
   (`gh pr merge <n> --repo VexedPanda/slitherWasm --auto --merge`), so it merges with a merge commit once CI (build, lint,
-  typecheck, qunit, consistency) passes. No approval is needed before pushing, opening or merging; only stop to ask if
+  typecheck, qunit) passes. No approval is needed before pushing, opening or merging; only stop to ask if
   CI fails in a way you can't fix.
 
 ## Checks
