@@ -1,6 +1,0 @@
-{
-  "boards": ["square-6x10", "square-10x10"],
-  "difficulties": ["NO_LIMIT", "EASY", "MEDIUM", "HARD"],
-  "seeds": [1, 2, 3],
-  "canSolveDifficulties": ["EASY", "MEDIUM", "HARD"]
-}
