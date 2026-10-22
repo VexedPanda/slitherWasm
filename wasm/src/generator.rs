@@ -38,6 +38,9 @@ const MAX_KNOWN_SOLUTIONS: usize = 200;
 // the board are retried
 const LOOP_OUTSIDE_ODDS: u64 = 3;
 const LOOP_MIN_INSIDE_DIVISOR: usize = 3;
+// Random loops grow towards faces more than this many faces away from a face the loop touches (far from the loop, faces
+// need few values, leaving large areas without values)
+const LOOP_MAX_GAP: u32 = 1;
 // Faces per minimization cluster (see Generator::start_minimize)
 const MINIMIZE_CLUSTER_SIZE: usize = 32;
 const WITNESS_ROUNDS: u64 = 256;
@@ -271,8 +274,9 @@ impl Generator {
 
     // A random loop filling the board (as in Loopy): grows a region of faces from a random face, adding random
     // neighboring faces while its boundary stays a single loop, until none can be added. Some neighboring faces are
-    // instead kept outside for good (so the outside also reaches across the board, and the loop winds through it).
-    // Retries while the region is small. Returns the loop's sorted edges.
+    // instead kept outside (so the outside also reaches across the board, and the loop winds through it). When none can
+    // be added while faces are far from the loop (walled off by faces kept outside), the neighboring faces near them are
+    // tried again, growing the region towards them. Retries while the region is small. Returns the loop's sorted edges.
     fn random_loop(&mut self, board: &Board) -> Vec<u32> {
         loop {
             let (edges, inside) = self.random_region_loop(board);
@@ -280,6 +284,29 @@ impl Generator {
                 return edges;
             }
         }
+    }
+
+    // For each face, how many faces away it is from the nearest of these faces (u32::MAX if none is reachable)
+    fn face_distances(board: &Board, sources: impl Iterator<Item = u32>) -> Vec<u32> {
+        let mut distance = vec![u32::MAX; board.num_faces];
+        let mut queue = std::collections::VecDeque::new();
+        for f in sources {
+            if distance[f as usize] == u32::MAX {
+                distance[f as usize] = 0;
+                queue.push_back(f);
+            }
+        }
+        while let Some(f) = queue.pop_front() {
+            for &e in board.face_edges_of(f as usize) {
+                for &g in &board.edge_faces[e as usize] {
+                    if g != u32::MAX && distance[g as usize] == u32::MAX {
+                        distance[g as usize] = distance[f as usize] + 1;
+                        queue.push_back(g);
+                    }
+                }
+            }
+        }
+        distance
     }
 
     fn random_region_loop(&mut self, board: &Board) -> (Vec<u32>, usize) {
@@ -298,6 +325,8 @@ impl Generator {
         };
         let start = (self.random() % board.num_faces as u64) as u32;
         let mut candidate = Some(start);
+        let mut inside_count = 0;
+        let mut refilled_at = None;
         loop {
             if let Some(f) = candidate {
                 let f = f as usize;
@@ -354,6 +383,7 @@ impl Generator {
                     }
                 }
                 if valid {
+                    inside_count += 1;
                     for &e in edges {
                         for &g in &board.edge_faces[e as usize] {
                             if g != u32::MAX && !inside[g as usize] && !outside[g as usize] && !in_frontier[g as usize]
@@ -380,7 +410,34 @@ impl Generator {
                 }
             }
             if frontier.is_empty() {
-                break;
+                // Stop once trying again added nothing
+                if refilled_at == Some(inside_count) {
+                    break;
+                }
+                refilled_at = Some(inside_count);
+                // Faces far from the loop, and how far each face is from them
+                let touching = (0..board.num_faces as u32).filter(|&f| {
+                    board
+                        .face_edges_of(f as usize)
+                        .iter()
+                        .any(|&e| is_loop(&inside, e as usize))
+                });
+                let loop_distance = Self::face_distances(board, touching);
+                let far = (0..board.num_faces as u32).filter(|&f| loop_distance[f as usize] > LOOP_MAX_GAP);
+                let far_distance = Self::face_distances(board, far);
+                for f in 0..board.num_faces {
+                    if !inside[f]
+                        && far_distance[f] <= LOOP_MAX_GAP + 1
+                        && board.face_edges_of(f).iter().any(|&e| is_loop(&inside, e as usize))
+                    {
+                        outside[f] = false;
+                        in_frontier[f] = true;
+                        frontier.push(f as u32);
+                    }
+                }
+                if frontier.is_empty() {
+                    break;
+                }
             }
             let index = (self.random() % frontier.len() as u64) as usize;
             let f = frontier.swap_remove(index);
@@ -396,7 +453,7 @@ impl Generator {
             (0..board.num_edges as u32)
                 .filter(|&e| is_loop(&inside, e as usize))
                 .collect(),
-            inside.iter().filter(|&&i| i).count(),
+            inside_count,
         )
     }
 
