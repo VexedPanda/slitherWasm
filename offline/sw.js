@@ -4,7 +4,8 @@
 // Everything the user-facing pages (index.html, play.html) can load is downloaded when the worker installs, and then
 // served from the cache first. Chunk file names aren't content-hashed, so a whole build is cached together (one cache
 // per version) and a new version only takes over once every tab using the old one has closed, so a page never mixes
-// files from two builds.
+// files from two builds. Cached files never expire on their own (no TTL): they're kept until a newer build replaces
+// them, or the browser evicts the site's storage (src/offline/registerServiceWorker.ts asks for it to be persistent).
 
 const VERSION = __VERSION__;
 const PRECACHE = __PRECACHE__;

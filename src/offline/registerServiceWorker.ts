@@ -5,5 +5,11 @@ export const registerServiceWorker = (): void => {
     navigator.serviceWorker.register(new URL('sw.js', document.baseURI)).catch((e) => {
       console.warn('Service worker registration failed, so this will not work offline', e);
     });
+
+    // The offline cache has no expiry of its own (it's kept until a newer build replaces it), but browsers may evict
+    // "best-effort" storage under storage pressure or after a while without visits (e.g. Safari after 7 days). Ask
+    // for persistent storage so it's kept. Chromium decides silently (e.g. granting it to bookmarked or installed
+    // sites), Firefox asks the user once; if it's denied, nothing else changes.
+    navigator.storage?.persist?.().catch(() => {});
   }
 };
