@@ -14,8 +14,9 @@ import { BasicPuzzle } from '../model/puzzle/BasicPuzzle.ts';
 import { TPropertyPuzzle } from '../model/puzzle/TPuzzle.ts';
 import { safeSolve } from '../model/solver/safeSolve.ts';
 
-import { Contour } from '../scan/Contour.ts';
-import { ScanOptions } from '../scan/scanURL.ts';
+// (Types only, so the scanning code, with OpenCV, only loads when scanning, see GenNode)
+import type { Contour } from '../scan/Contour.ts';
+import type { ScanOptions } from '../scan/scanURL.ts';
 
 import assert, { assertEnabled } from '../workarounds/assert.ts';
 

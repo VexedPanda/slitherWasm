@@ -9,7 +9,7 @@ import { polygonGenerators } from '../model/board/generators/polygonGenerators.t
 import { TCompleteData } from '../model/data/combined/TCompleteData.ts';
 import { deserializeState } from '../model/data/core/deserializeState.ts';
 import FaceValue from '../model/data/face-value/FaceValue.ts';
-import CanSolveDifficulty from '../model/generator/CanSolveDifficulty.ts';
+import DifficultyLevel from '../model/generator/DifficultyLevel.ts';
 import { GenerationProgressEvent } from '../model/generator/GenerationProgressEvent.ts';
 import { TSolvedPuzzle } from '../model/generator/TSolvedPuzzle.ts';
 import { canSolveDifficultyProperty } from '../model/generator/canSolveDifficultyProperty.ts';
@@ -73,7 +73,7 @@ const updateStatus = () => {
 const storeGenerationState = (
   generator: PolygonGenerator,
   parameters: Record<string, any>,
-  canSolveDifficulty: CanSolveDifficulty,
+  canSolveDifficulty: DifficultyLevel,
   solvedPuzzle: TSolvedPuzzle<TStructure, TCompleteData> | null,
   failed = false,
   progress: GenerationProgressEvent[] = [],
@@ -140,7 +140,7 @@ export class GenerationProgressRecorder {
   public constructor(
     private readonly generator: PolygonGenerator,
     private readonly parameters: Record<string, any>,
-    private readonly canSolveDifficulty: CanSolveDifficulty,
+    private readonly canSolveDifficulty: DifficultyLevel,
     public readonly progress: GenerationProgressEvent[] = [],
   ) {
     currentRecorder?.stop();
@@ -205,7 +205,7 @@ const loadGenerationState = (): StoredGenerationState | null => {
 export const getPreGenerationKey = (
   generator: PolygonGenerator,
   parameters: Record<string, any>,
-  canSolveDifficulty: CanSolveDifficulty,
+  canSolveDifficulty: DifficultyLevel,
 ): string => {
   return `${generator.name}/${JSON.stringify(parameters)}/${canSolveDifficulty.name}`;
 };
@@ -222,7 +222,7 @@ const clearPreGeneratedPuzzle = (): void => {
 export const startPreGeneratingPuzzle = (
   generator: PolygonGenerator,
   parameters: Record<string, any>,
-  canSolveDifficulty: CanSolveDifficulty,
+  canSolveDifficulty: DifficultyLevel,
   // Progress of an interrupted generation with these settings to continue from
   resumeProgress: GenerationProgressEvent[] = [],
 ): void => {
@@ -300,7 +300,7 @@ export const startPreGeneratingPuzzle = (
 export const takePreGeneratedPuzzle = (
   generator: PolygonGenerator,
   parameters: Record<string, any>,
-  canSolveDifficulty: CanSolveDifficulty,
+  canSolveDifficulty: DifficultyLevel,
 ): Promise<TSolvedPuzzle<TStructure, TCompleteData> | null> | null => {
   const key = getPreGenerationKey(generator, parameters, canSolveDifficulty);
 
@@ -356,7 +356,7 @@ export const resumePreGeneration = (): void => {
   const state = loadGenerationState() ?? getGenerateNodeSettings();
 
   const generator = polygonGenerators.find((generator) => generator.name === state.generator);
-  const canSolveDifficulty = CanSolveDifficulty.enumeration.getValue(state.canSolveDifficulty);
+  const canSolveDifficulty = DifficultyLevel.enumeration.getValue(state.canSolveDifficulty);
   if (!generator || !canSolveDifficulty) {
     return;
   }

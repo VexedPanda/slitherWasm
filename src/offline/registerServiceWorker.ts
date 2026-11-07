@@ -2,9 +2,20 @@
 // builds, since the dev server doesn't have one.
 export const registerServiceWorker = (): void => {
   if (import.meta.env.PROD && 'serviceWorker' in navigator) {
-    navigator.serviceWorker.register(new URL('sw.js', document.baseURI)).catch((e) => {
-      console.warn('Service worker registration failed, so this will not work offline', e);
-    });
+    // Wait until the page has loaded (and had a moment to show the puzzle), since installing a new version downloads
+    // everything for offline use, which would otherwise compete with the page's own loading
+    const register = () => {
+      setTimeout(() => {
+        navigator.serviceWorker.register(new URL('sw.js', document.baseURI)).catch((e) => {
+          console.warn('Service worker registration failed, so this will not work offline', e);
+        });
+      }, 1000);
+    };
+    if (document.readyState === 'complete') {
+      register();
+    } else {
+      window.addEventListener('load', register, { once: true });
+    }
 
     // The offline cache has no expiry of its own (it's kept until a newer build replaces it), but browsers may evict
     // "best-effort" storage under storage pressure or after a while without visits (e.g. Safari after 7 days). Ask

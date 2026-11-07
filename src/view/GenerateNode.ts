@@ -29,7 +29,7 @@ import { getCentroid } from '../model/board/core/createBoardDescriptor.ts';
 import { polygonGenerators } from '../model/board/generators/polygonGenerators.ts';
 import { TCompleteData } from '../model/data/combined/TCompleteData.ts';
 import FaceValue from '../model/data/face-value/FaceValue.ts';
-import CanSolveDifficulty from '../model/generator/CanSolveDifficulty.ts';
+import DifficultyLevel from '../model/generator/DifficultyLevel.ts';
 import { TSolvedPuzzle } from '../model/generator/TSolvedPuzzle.ts';
 import { canSolveDifficultyProperty } from '../model/generator/canSolveDifficultyProperty.ts';
 import { BasicPuzzle } from '../model/puzzle/BasicPuzzle.ts';
@@ -123,22 +123,22 @@ export class GenerateNode extends HBox {
           canSolveDifficultyProperty,
           [
             {
-              value: CanSolveDifficulty.EASY,
+              value: DifficultyLevel.EASY,
               createNode: () => new UIText('Easy'),
               options: { accessibleName: 'Easy' },
             },
             {
-              value: CanSolveDifficulty.MEDIUM,
+              value: DifficultyLevel.MEDIUM,
               createNode: () => new UIText('Medium'),
               options: { accessibleName: 'Medium' },
             },
             {
-              value: CanSolveDifficulty.HARD,
+              value: DifficultyLevel.HARD,
               createNode: () => new UIText('Hard'),
               options: { accessibleName: 'Hard' },
             },
             {
-              value: CanSolveDifficulty.NO_LIMIT,
+              value: DifficultyLevel.NO_LIMIT,
               createNode: () => new UIText('No Limit'),
               options: { accessibleName: 'No Limit' },
             },

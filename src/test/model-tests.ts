@@ -2,6 +2,7 @@ import '../../node_modules/qunit/qunit/qunit.css';
 
 import { enableAssert } from 'scenerystack/assert';
 
+import '../model/generator/test/DifficultyLevel.test.ts';
 import '../model/pattern/feature/test/FeatureSet.test.ts';
 import '../model/pattern/generation/test/RichSolution.test.ts';
 import '../model/pattern/generation/test/generation.test.ts';
