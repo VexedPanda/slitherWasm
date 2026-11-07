@@ -10,6 +10,13 @@ and moves the hot puzzle logic (solving and generation) into a Rust → WebAssem
 
 `npx eslint .` to lint.
 
+## Offline
+
+Builds work fully offline once a page has been opened: `offline/vite-plugin-offline.js` writes a service worker
+(`dist/sw.js`, from the `offline/sw.js` template) that precaches everything `index.html` and `play.html` can load,
+including puzzle scanning. Tesseract.js (OCR for scanning) is pointed at local copies of its worker, core and English
+training data under `tesseract/` instead of its default CDN. The dev server doesn't use the service worker.
+
 ## WebAssembly core
 
 `wasm/` is a Rust crate compiled to `wasm32-unknown-unknown`: a compact CDCL SAT solver (`sat.rs`) and the Slitherlink

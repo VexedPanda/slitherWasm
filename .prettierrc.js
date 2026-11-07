@@ -21,6 +21,7 @@ const config = {
     'scenerystack',
     '^[./]*SlitherQueryParameters\.ts$',
     '^[./]*model',
+    '^[./]*offline',
     '^[./]*scan',
     '^[./]*targets',
     '^[./]*test',

@@ -27,7 +27,16 @@ const scanFaceValues = async (url: string, providedOptions?: scanFaceValuesOptio
   const options = optionize3<scanFaceValuesOptions>()({}, defaults, providedOptions);
 
   if (!worker) {
-    worker = await createWorker('eng');
+    // Load Tesseract's worker, core and training data from our own copies (see offline/vite-plugin-offline.js) instead
+    // of its default CDN, so scanning works offline
+    const tesseractURL = new URL('tesseract/', location.href).href;
+    worker = await createWorker('eng', tesseract.OEM.LSTM_ONLY, {
+      workerPath: `${tesseractURL}worker.min.js`,
+      corePath: tesseractURL,
+      langPath: tesseractURL,
+      // Load the worker from its URL, rather than a blob that imports it, so it's plainly same-origin
+      workerBlobURL: false,
+    });
   }
 
   worker.setParameters({

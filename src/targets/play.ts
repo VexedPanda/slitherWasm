@@ -18,6 +18,8 @@ import { TPropertyPuzzle } from '../model/puzzle/TPuzzle.ts';
 import { getStartupPuzzleModel } from '../model/puzzle/getStartupPuzzleModel.ts';
 import { getSolvablePropertyPuzzle } from '../model/solver/SATSolver.ts';
 
+import { registerServiceWorker } from '../offline/registerServiceWorker.ts';
+
 import { workaroundResolveStep } from '../util/sleep.ts';
 
 import ControlBarNode from '../view/ControlBarNode.ts';
@@ -33,6 +35,9 @@ import { currentPuzzleStyle, showPuzzleStyleProperty } from '../view/puzzle/puzz
 import { scene } from '../view/scene.ts';
 
 import { resumePreGeneration } from '../workers/nextPuzzlePreGenerator.ts';
+
+// Works offline once loaded (in builds)
+registerServiceWorker();
 
 // TODO: also see web worker cases where this is used
 // TODO: factor out
