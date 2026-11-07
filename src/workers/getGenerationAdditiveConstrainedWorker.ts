@@ -7,7 +7,7 @@ import { TStructure } from '../model/board/core/TStructure.ts';
 import { serializeBoard } from '../model/board/core/serializeBoard.ts';
 import { TCompleteData } from '../model/data/combined/TCompleteData.ts';
 import FaceValue from '../model/data/face-value/FaceValue.ts';
-import CanSolveDifficulty from '../model/generator/CanSolveDifficulty.ts';
+import DifficultyLevel from '../model/generator/DifficultyLevel.ts';
 import { GenerationProgressEvent } from '../model/generator/GenerationProgressEvent.ts';
 import { TSerializedSolvedPuzzle, TSolvedPuzzle } from '../model/generator/TSolvedPuzzle.ts';
 import { deserializeSolvedPuzzle } from '../model/generator/deserializeSolvedPuzzle.ts';
@@ -63,7 +63,7 @@ releaseWorker();
 
 export const generateAdditiveConstrainedWithWorker = async (
   board: TBoard,
-  canSolveDifficulty: CanSolveDifficulty,
+  canSolveDifficulty: DifficultyLevel,
   interruptedProperty: TReadOnlyProperty<boolean>,
   faceDefineEmitter: TEmitter<[index: number, state: FaceValue]>,
   faceMinimizeEmitter: TEmitter<[index: number, state: FaceValue]>,

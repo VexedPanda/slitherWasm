@@ -11,8 +11,6 @@ import { TCompleteData } from '../model/data/combined/TCompleteData.ts';
 import { BasicPuzzle } from '../model/puzzle/BasicPuzzle.ts';
 import { TPropertyPuzzle } from '../model/puzzle/TPuzzle.ts';
 
-import scanURL from '../scan/scanURL.ts';
-
 export type GenNodeOptions = {
   loadPuzzle: (puzzle: TPropertyPuzzle<TStructure, TCompleteData>) => void;
 };
@@ -71,10 +69,11 @@ export class GenNode extends PopupNode {
                     reader.onloadend = async () => {
                       const url = reader.result as string;
 
-                      // const scanURL = ( await import ( '../scan/scanURL.ts' ) ).default;
-
                       const scanNode = new ScanNode(viewContext);
                       scanNode.show();
+
+                      // Loaded on demand, since it includes OpenCV and Tesseract (many megabytes)
+                      const scanURL = (await import('../scan/scanURL.ts')).default;
 
                       const puzzle = await scanURL(url, scanNode.getScanOptions());
 
