@@ -18,6 +18,8 @@ import { planarPatternMaps } from '../model/pattern/pattern-board/planar-map/pla
 import { PatternRule } from '../model/pattern/pattern-rule/PatternRule.ts';
 import { puzzleFromCompressedString } from '../model/puzzle/puzzleFromCompressedString.ts';
 
+import { registerServiceWorker } from '../offline/registerServiceWorker.ts';
+
 import { sleep } from '../util/sleep.ts';
 
 import { lightTheme } from '../view/Theme.ts';
@@ -35,6 +37,9 @@ import {
   getPureColoringPuzzleStyleWithTheme,
   getSectorsWithColorsPuzzleStyleWithTheme,
 } from '../view/puzzle/puzzleStyles.ts';
+
+// Works offline once loaded (in builds)
+registerServiceWorker();
 
 if (!import.meta.env.PROD) {
   // TODO: We should actually... have stripped these, something is going wrong

@@ -2,6 +2,8 @@ import modify from 'rollup-plugin-modify';
 import unassert from 'rollup-plugin-unassert';
 import { defineConfig } from 'vite';
 
+import offline from './offline/vite-plugin-offline.js';
+
 /*
   - Build failure, trying `npm run build --max-old-space-size`
     - export NODE_OPTIONS=--max-old-space-size=32768
@@ -40,6 +42,9 @@ export default defineConfig({
   },
 
   plugins: [
+    // Local copies of Tesseract's files, and the service worker (see offline/vite-plugin-offline.js)
+    offline(),
+
     // Redirect window to self (see appOnly above)
     appOnly(
       modify({
