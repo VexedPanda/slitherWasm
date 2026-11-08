@@ -12,10 +12,12 @@ and moves the hot puzzle logic (solving and generation) into a Rust → WebAssem
 
 ## Offline
 
-Builds work fully offline once a page has been opened: `offline/vite-plugin-offline.js` writes a service worker
-(`dist/sw.js`, from the `offline/sw.js` template) that precaches everything `index.html` and `play.html` can load,
-including puzzle scanning. Tesseract.js (OCR for scanning) is pointed at local copies of its worker, core and English
-training data under `tesseract/` instead of its default CDN. The dev server doesn't use the service worker.
+Playing and creating puzzles works offline once a page has been opened: `offline/vite-plugin-offline.js` writes a
+service worker (`dist/sw.js`, from the `offline/sw.js` template) that precaches `play.html` and everything it can load,
+except puzzle scanning (OpenCV and Tesseract, many megabytes). Scanning and the other pages are cached the first time
+they're used, so they work offline after that. Tesseract.js (OCR for scanning) is pointed at local copies of its worker,
+core and English training data under `tesseract/` instead of its default CDN. The dev server doesn't use the service
+worker.
 
 ## WebAssembly core
 

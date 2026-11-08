@@ -1,8 +1,9 @@
 // Service worker that makes the site work offline. It's a template: vite-plugin-offline.js fills in the version and the
 // list of files to precache when building (it isn't used by the dev server).
 //
-// Everything the user-facing pages (index.html, play.html) can load is downloaded when the worker installs, and then
-// served from the cache first. Chunk file names aren't content-hashed, so a whole build is cached together (one cache
+// What's needed to play and create puzzles (play.html and what it loads, except the scanner) is downloaded when the
+// worker installs. Everything else (the scanner, other pages) is cached the first time it's loaded, so it also works
+// offline after that. Cached files are served from the cache first. Chunk file names aren't content-hashed, so a whole build is cached together (one cache
 // per version) and a new version only takes over once every tab using the old one has closed, so a page never mixes
 // files from two builds. Cached files never expire on their own (no TTL): they're kept until a newer build replaces
 // them, or the browser evicts the site's storage (src/offline/registerServiceWorker.ts asks for it to be persistent).

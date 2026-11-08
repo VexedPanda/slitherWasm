@@ -1,8 +1,8 @@
 // Makes the site work offline:
 // - Serves/emits the files Tesseract.js (puzzle scanning) would otherwise load from a CDN (its worker, its WebAssembly
 //   core, and the English training data) under `tesseract/`, see src/scan/scanFaceValues.ts.
-// - Writes a service worker (offline/sw.js, registered by src/offline/registerServiceWorker.ts) that precaches
-//   everything the user-facing pages can load.
+// - Writes a service worker (offline/sw.js, registered by src/offline/registerServiceWorker.ts) that precaches what's
+//   needed to play and create puzzles. Everything else (the scanner, other pages) is cached when first used.
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -27,8 +27,14 @@ const tesseractFiles = () => {
   };
 };
 
-// Pages that should work offline (the others are developer tools)
-const OFFLINE_PAGES = ['index.html', 'play.html'];
+// Pages to precache, with what they can load
+const PRECACHED_PAGES = ['play.html'];
+
+// Not precached, since it's large and optional: puzzle scanning (OpenCV and Tesseract, loaded on demand)
+const isScanning = (output) =>
+  output.fileName.startsWith('tesseract/') ||
+  (output.type === 'chunk' &&
+    Object.keys(output.modules).some((id) => /\/src\/scan\/|@techstark\/opencv-js|tesseract\.js/.test(id)));
 
 const listFiles = (dir, prefix = '') =>
   fs.existsSync(dir) ?
@@ -41,20 +47,24 @@ const listFiles = (dir, prefix = '') =>
       )
   : [];
 
-// Everything in the bundle that the offline pages can (transitively) load
-const getReachableFiles = (bundle) => {
-  const fileNames = Object.keys(bundle);
+// Everything (in the bundle, or a public file) that the precached pages can (transitively) load, except scanning
+const getReachableFiles = (bundle, publicFiles) => {
+  const fileNames = [...Object.keys(bundle), ...publicFiles];
   const reachable = new Set();
   const queue = [];
   const add = (fileName) => {
-    if (bundle[fileName] && !reachable.has(fileName)) {
+    if (reachable.has(fileName)) {
+      return;
+    }
+    if (bundle[fileName] ? !isScanning(bundle[fileName]) : publicFiles.includes(fileName)) {
       reachable.add(fileName);
-      queue.push(fileName);
+      if (bundle[fileName]) {
+        queue.push(fileName);
+      }
     }
   };
 
-  OFFLINE_PAGES.forEach(add);
-  fileNames.filter((fileName) => fileName.startsWith('tesseract/')).forEach(add);
+  PRECACHED_PAGES.forEach(add);
 
   while (queue.length) {
     const output = bundle[queue.shift()];
@@ -110,7 +120,7 @@ export default function offline() {
     writeBundle(outputOptions, bundle) {
       const outDir = outputOptions.dir ?? config.build.outDir;
       const publicFiles = config.publicDir ? listFiles(config.publicDir) : [];
-      const precache = [...new Set([...getReachableFiles(bundle), ...publicFiles])].sort();
+      const precache = getReachableFiles(bundle, publicFiles).sort();
 
       const hash = createHash('sha256');
       for (const file of precache) {
